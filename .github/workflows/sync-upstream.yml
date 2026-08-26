@@ -84,15 +84,7 @@ jobs:
             # 重跑去广告脚本（幂等），刷新品牌与供应商预设
             node scripts/debrand.mjs
             # 版本号与上游 tag 保持一致（仅在必要时改动，保留其它格式）
-            VER="${TAG#v}" node - <<'NODE'
-            const fs = require('fs');
-            const v = process.env.VER;
-            for (const p of ['package.json', 'src-tauri/tauri.conf.json']) {
-              let s = fs.readFileSync(p, 'utf8');
-              s = s.replace(/("version"\s*:\s*")[^"]*(")/, '$1' + v + '$2');
-              fs.writeFileSync(p, s);
-            }
-            NODE
+            VER="${TAG#v}" node -e 'const fs=require("fs");const v=process.env.VER;for(const p of ["package.json","src-tauri/tauri.conf.json"]){let s=fs.readFileSync(p,"utf8");s=s.replace(/("version"\s*:\s*")[^"]*(")/,"$1"+v+"$2");fs.writeFileSync(p,s);}'
             git add -A
             git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
           else
