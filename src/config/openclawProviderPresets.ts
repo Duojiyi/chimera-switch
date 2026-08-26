@@ -101,7 +101,7 @@ export const openclawApiProtocols = [
 export const openclawProviderPresets: OpenClawProviderPreset[] = [
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       baseUrl: "https://api.chimerahub.org/v1",
       apiKey: "",

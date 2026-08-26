@@ -288,7 +288,7 @@ export function getPresetModelDefaults(
 export const opencodeProviderPresets: OpenCodeProviderPreset[] = [
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       npm: "@ai-sdk/openai-compatible",
       name: "ChimeraHub",

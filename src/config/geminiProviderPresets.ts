@@ -53,7 +53,7 @@ export const geminiProviderPresets: GeminiProviderPreset[] = [
   },
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       env: {
         GOOGLE_GEMINI_BASE_URL: "https://api.chimerahub.org/v1",

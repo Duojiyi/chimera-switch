@@ -87,7 +87,7 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
   {
     name: "ChimeraHub",
     providerKey: "chimerahub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       name: "ChimeraHub",
       baseUrl: "https://api.chimerahub.org/v1",

@@ -164,7 +164,7 @@ requires_openai_auth = true`,
   },
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     auth: { OPENAI_API_KEY: "" },
     config: `model_provider = "custom"
 model = "gpt-5.6-sol"

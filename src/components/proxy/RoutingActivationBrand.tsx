@@ -85,7 +85,7 @@ export function RoutingActivationBrand({
       )}
 
       <motion.a
-        href="https://chimerahub.org"
+        href="https://api.chimerahub.org"
         target="_blank"
         rel="noreferrer"
         className={cn(

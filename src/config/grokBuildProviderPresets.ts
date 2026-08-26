@@ -81,7 +81,7 @@ requires_openai_auth = true`;
 export const grokBuildProviderPresets: GrokBuildProviderPreset[] = [
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     auth: { OPENAI_API_KEY: "" },
     config: `model_provider = "custom"
 model = "grok-4.5"

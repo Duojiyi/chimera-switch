@@ -605,7 +605,7 @@ jobs:
           body: |
             ## Chimera Switch ${{ github.ref_name }}
 
-            🌐 **Only Official Website / 唯一官方网站 / 唯一の公式サイト**: [chimerahub.org](https://chimerahub.org)
+            🌐 **Only Official Website / 唯一官方网站 / 唯一の公式サイト**: [api.chimerahub.org](https://api.chimerahub.org)
 
             Claude Code 供应商切换工具
 

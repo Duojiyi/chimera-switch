@@ -92,7 +92,7 @@ export const providerPresets: ProviderPreset[] = [
   },
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       env: {
         ANTHROPIC_BASE_URL: "https://api.chimerahub.org/v1",

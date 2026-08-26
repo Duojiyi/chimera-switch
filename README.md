@@ -12,7 +12,7 @@
 <a href="https://trendshift.io/repositories/15372" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15372" alt="Duojiyi%2Fchimera-switch | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 <a href="https://www.star-history.com/#Duojiyi/chimera-switch&Date"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/badge?repo=Duojiyi/chimera-switch&theme=dark" /><img alt="Star History Rank" src="https://api.star-history.com/badge?repo=Duojiyi/chimera-switch" width="196" height="55" /></picture></a>
 
-### 🌐 The Only Official Website: **[chimerahub.org](https://chimerahub.org)**
+### 🌐 The Only Official Website: **[api.chimerahub.org](https://api.chimerahub.org)**
 
 English | [中文](README_ZH.md) | [日本語](README_JA.md) | [Deutsch](README_DE.md) | [Changelog](CHANGELOG.md)
 

@@ -155,7 +155,7 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
   },
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     baseUrl: "https://api.chimerahub.org/v1",
     mode: "proxy",
     apiFormat: "openai_chat",

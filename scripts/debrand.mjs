@@ -18,7 +18,7 @@ const ROOT = path.resolve(__dirname, "..");
 
 const RELAY = {
   name: "ChimeraHub",
-  website: "https://chimerahub.org",
+  website: "https://api.chimerahub.org",
   base: "https://api.chimerahub.org/v1",
 };
 
@@ -532,7 +532,7 @@ function cleanupResiduals() {
 // 3) 品牌改名（幂等字符串替换）
 // ---------------------------------------------------------------------------
 const REPLACEMENTS = [
-  ["ccswitch.io", "chimerahub.org"],
+  ["ccswitch.io", "api.chimerahub.org"],
   ["CC-Switch", "Chimera-Switch"],
   ["CC Switch", "Chimera Switch"],
   ["cc-switch", "chimera-switch"],

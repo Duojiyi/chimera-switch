@@ -161,7 +161,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
   },
   {
     name: "ChimeraHub",
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     settingsConfig: {
       name: "chimerahub",
       base_url: "https://api.chimerahub.org/v1",

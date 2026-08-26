@@ -82,7 +82,7 @@ export const universalProviderPresets: UniversalProviderPreset[] = [
         model: "gemini-2.5-pro",
       },
     },
-    websiteUrl: "https://chimerahub.org",
+    websiteUrl: "https://api.chimerahub.org",
     icon: "openai",
     iconColor: "#10B981",
     description: "ChimeraHub 中转站",
