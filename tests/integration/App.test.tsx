@@ -204,8 +204,8 @@ describe("App integration with MSW", () => {
     toastErrorMock.mockReset();
     skillsPanelMocks.checkUpdates.mockReset();
     skillsPanelMocks.openDiscovery.mockReset();
-    localStorage.removeItem("cc-switch-last-view");
-    localStorage.removeItem("cc-switch-last-app");
+    localStorage.removeItem("chimera-switch-last-view");
+    localStorage.removeItem("chimera-switch-last-app");
   });
 
   it("covers basic provider flows via real hooks", async () => {
@@ -351,7 +351,7 @@ describe("App integration with MSW", () => {
   });
 
   it("warns without blocking when removing Pi's global default provider", async () => {
-    localStorage.setItem("cc-switch-last-app", "pi");
+    localStorage.setItem("chimera-switch-last-app", "pi");
     setProviders("pi", {
       custom: {
         id: "custom",
@@ -444,7 +444,7 @@ describe("App integration with MSW", () => {
   });
 
   it("hosts the Skills check-update action in the App toolbar", async () => {
-    localStorage.setItem("cc-switch-last-view", "skills");
+    localStorage.setItem("chimera-switch-last-view", "skills");
     const { default: App } = await import("@/App");
     renderApp(App);
 
@@ -461,7 +461,7 @@ describe("App integration with MSW", () => {
   });
 
   it("routes the Skills discover toolbar action through the panel guard", async () => {
-    localStorage.setItem("cc-switch-last-view", "skills");
+    localStorage.setItem("chimera-switch-last-view", "skills");
     const { default: App } = await import("@/App");
     renderApp(App);
 

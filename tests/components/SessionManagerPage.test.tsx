@@ -18,7 +18,7 @@ import { setSessionFixtures } from "../msw/state";
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
 const GROUP_EXPANSION_STORAGE_KEY =
-  "cc-switch.sessionManager.groupExpansionState";
+  "chimera-switch.sessionManager.groupExpansionState";
 
 vi.mock("sonner", () => ({
   toast: {
@@ -155,7 +155,7 @@ describe("SessionManagerPage", () => {
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
     Element.prototype.scrollIntoView = vi.fn();
-    window.localStorage.removeItem("cc-switch.sessionManager.listViewMode");
+    window.localStorage.removeItem("chimera-switch.sessionManager.listViewMode");
     window.localStorage.removeItem(GROUP_EXPANSION_STORAGE_KEY);
 
     const sessions: SessionMeta[] = [
