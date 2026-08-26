@@ -25,7 +25,7 @@ interface AppSwitcherProps {
   visibleApps?: VisibleApps;
 }
 
-const STORAGE_KEY = "cc-switch-last-app";
+const STORAGE_KEY = "chimera-switch-last-app";
 
 const APP_ICON_NAME: Record<AppId, string> = {
   claude: "claude",

@@ -1,7 +1,7 @@
 {
-  "name": "cc-switch",
+  "name": "chimera-switch",
   "version": "3.20.0",
-  "description": "All-in-One Assistant for Claude Code, Codex & Gemini CLI",
+  "description": "Chimera Switch — clean multi-app assistant manager with a single built-in relay provider",
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",

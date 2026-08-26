@@ -60,33 +60,32 @@ const NEWAPI_DEFAULT_MODELS: UniversalProviderModels = {
  */
 export const universalProviderPresets: UniversalProviderPreset[] = [
   {
-    name: "NewAPI",
+    name: "ChimeraHub",
     providerType: "newapi",
     defaultApps: {
       claude: true,
       codex: true,
       gemini: true,
     },
-    defaultModels: NEWAPI_DEFAULT_MODELS,
-    websiteUrl: "https://www.newapi.pro",
-    icon: "newapi",
-    iconColor: "#00A67E",
-    description:
-      "NewAPI 是一个可自部署的 API 网关，支持 Anthropic、OpenAI、Gemini 等多种协议",
-  },
-  {
-    name: "自定义网关",
-    providerType: "custom_gateway",
-    defaultApps: {
-      claude: true,
-      codex: true,
-      gemini: true,
+    defaultModels: {
+      claude: {
+        model: "claude-sonnet-4-5",
+        haikuModel: "claude-haiku-4-5",
+        sonnetModel: "claude-sonnet-4-5",
+        opusModel: "claude-opus-4-5",
+      },
+      codex: {
+        model: "gpt-5.6-sol",
+        reasoningEffort: "high",
+      },
+      gemini: {
+        model: "gemini-2.5-pro",
+      },
     },
-    defaultModels: NEWAPI_DEFAULT_MODELS,
+    websiteUrl: "https://chimerahub.org",
     icon: "openai",
-    iconColor: "#6366F1",
-    description: "自定义配置的 API 网关",
-    isCustomTemplate: true,
+    iconColor: "#10B981",
+    description: "ChimeraHub 中转站",
   },
 ];
 

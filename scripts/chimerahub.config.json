@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "comment": "Chimera Switch debrand 配置的单一来源。debrand 脚本（debrand.mjs）读取本文件，把每个 App 的预设列表清空为仅保留 ChimeraHub 这一个供应商，并自动填入对应端点与协议格式。改中转站端点/模型只需改这里。",
+  "relay": {
+    "name": "ChimeraHub",
+    "website": "https://chimerahub.org",
+    "apiBase": "https://api.chimerahub.org",
+    "keyField": "OPENAI_API_KEY"
+  },
+  "apps": {
+    "codex": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "openai_responses",
+      "model": "gpt-5.6-sol",
+      "confirmed": true
+    },
+    "claude": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Anthropic 兼容端点路径"
+    },
+    "claude-desktop": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Anthropic 兼容端点路径"
+    },
+    "gemini": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "gemini_native",
+      "model": "gemini-2.5-pro",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Gemini 兼容端点路径"
+    },
+    "grokbuild": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "openai_chat",
+      "model": "grok-4.1",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Grok/OpenAI 兼容端点"
+    },
+    "opencode": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "openai_chat",
+      "model": "gpt-5.6",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 OpenCode 端点"
+    },
+    "openclaw": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "openai_chat",
+      "model": "gpt-5.6",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 OpenClaw 端点"
+    },
+    "hermes": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "chat_completions",
+      "model": "gpt-5.6",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Hermes 端点"
+    },
+    "pi": {
+      "base_url": "https://api.chimerahub.org/v1",
+      "apiFormat": "openai_chat",
+      "model": "gpt-5.6",
+      "confirmed": false,
+      "note": "TODO: 确认中转站 Pi 端点"
+    }
+  }
+}

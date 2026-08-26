@@ -78,9 +78,9 @@ import {
 } from "./utils";
 
 const SESSION_LIST_VIEW_MODE_STORAGE_KEY =
-  "cc-switch.sessionManager.listViewMode";
+  "chimera-switch.sessionManager.listViewMode";
 const SESSION_GROUP_EXPANSION_STORAGE_KEY =
-  "cc-switch.sessionManager.groupExpansionState";
+  "chimera-switch.sessionManager.groupExpansionState";
 
 type ProviderFilter =
   | "all"
