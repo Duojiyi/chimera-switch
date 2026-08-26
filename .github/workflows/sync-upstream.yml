@@ -1,0 +1,126 @@
+name: Sync upstream
+
+# 上游 cc-switch（farion1231/cc-switch）发版后自动同步去广告版：
+#   1. 检测上游最新 release tag；
+#   2. 把该 tag 合并进本 fork 的 main，再重跑去广告脚本 scripts/debrand.mjs（幂等）；
+#   3. 把版本号对齐为上游版本，提交、推送 main，并以同名 tag 打标；
+#      打 tag 会触发 release.yml 全平台构建（去证书签名、保留 minisign 更新签名）。
+# 合并冲突无法自动解决时，放弃合并并开 issue 通知人工处理，不阻塞后续检测。
+#
+# 注意：打 tag 必须用 PAT（个人访问令牌）推送才能触发 release.yml——
+# 用默认 GITHUB_TOKEN 推送产生的事件不会再次触发工作流。
+# 请在仓库 Secrets 配置 SYNC_TOKEN（PAT，需 repo / contents:write 权限）。
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时检测一次（UTC）
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/farion1231/cc-switch.git || true
+          git fetch upstream --tags --prune
+
+      - name: Detect latest upstream release tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api repos/farion1231/cc-switch/releases --jq '.[0].tag_name' 2>/dev/null || true)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            TAG=$(git ls-remote --tags https://github.com/farion1231/cc-switch.git 'v*' \
+              | sed 's#.*refs/tags/##; s#\^{}##' | sort -V | tail -n1)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release tag: $TAG"
+
+      - name: Skip if already synced
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "Tag $TAG already exists on origin — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream and re-debrand
+        id: merge
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          TAG="${{ steps.upstream.outputs.tag }}"
+
+          if git merge --no-edit --no-ff "$TAG"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            # 重跑去广告脚本（幂等），刷新品牌与供应商预设
+            node scripts/debrand.mjs
+            # 版本号与上游 tag 保持一致（仅在必要时改动，保留其它格式）
+            VER="${TAG#v}" node - <<'NODE'
+            const fs = require('fs');
+            const v = process.env.VER;
+            for (const p of ['package.json', 'src-tauri/tauri.conf.json']) {
+              let s = fs.readFileSync(p, 'utf8');
+              s = s.replace(/("version"\s*:\s*")[^"]*(")/, '$1' + v + '$2');
+              fs.writeFileSync(p, s);
+            }
+            NODE
+            git add -A
+            git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git merge --abort || true
+          fi
+
+      - name: Push main and tag
+        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          git push origin main
+          git tag -f "$TAG" HEAD
+          git push origin "$TAG"
+
+      - name: Notify conflict
+        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          gh issue create \
+            --title "sync: 手动合并上游 $TAG" \
+            --body "自动合并上游 $TAG 时产生冲突，需要手动解决。解决后合并到 main 并执行：
+
+            \`\`\`
+            git fetch upstream --tags
+            git merge $TAG
+            git tag $TAG && git push origin $TAG
+            \`\`\`" \
+            || true

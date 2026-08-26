@@ -594,7 +594,9 @@ function main() {
     "README_DE.md",
     ...walk(path.join(ROOT, "src")),
     ...walk(path.join(ROOT, ".github", "workflows")),
-  ].map((p) => path.relative(ROOT, p));
+  ]
+    .map((p) => path.relative(ROOT, p))
+    .filter((p) => !p.endsWith("sync-upstream.yml"));
   for (const f of targets) rebrandFile(f);
 
   log("=== 完成 ===");
