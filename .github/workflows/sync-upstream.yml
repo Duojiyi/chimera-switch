@@ -43,7 +43,7 @@ jobs:
       - name: Add and fetch upstream
         run: |
           git remote add upstream https://github.com/farion1231/cc-switch.git || true
-          git fetch upstream --tags --prune
+          git fetch upstream --tags --prune --force
 
       - name: Detect latest upstream release tag
         id: upstream
