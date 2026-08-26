@@ -1194,7 +1194,7 @@
     "officialHint": "💡 公式プロバイダーはブラウザログインで、API Key は不要です",
     "providerKeyStatusLoading": "プロバイダー識別子の状態を読み込んでいます。しばらくしてからもう一度お試しください",
     "getApiKey": "API Key を取得",
-    
+
     "presets": {
       "ucloud": "Compshare",
       "ucloudCoding": "Compshare Coding Plan",

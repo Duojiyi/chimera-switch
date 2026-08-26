@@ -1195,7 +1195,7 @@
     "officialHint": "官方供應商使用瀏覽器登入，無需設定 API Key",
     "providerKeyStatusLoading": "正在載入供應商識別碼狀態，請稍後再試",
     "getApiKey": "取得 API Key",
-    
+
     "presets": {
       "ucloud": "優雲智算",
       "ucloudCoding": "優雲智算 Coding Plan",

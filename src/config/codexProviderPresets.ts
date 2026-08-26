@@ -76,47 +76,6 @@ wire_api = "responses"
 requires_openai_auth = true`;
 }
 
-function modelCatalog(
-  models: Array<
-    | string
-    | {
-        model: string;
-        displayName?: string;
-        contextWindow?: number;
-        // Native Responses (direct) overrides for the generated
-        // model-catalogs.json. Omitted input modalities are inferred by the
-        // backend: confirmed text-only models stay text-only; everything else
-        // defaults to text+image.
-        supportsParallelToolCalls?: boolean;
-        inputModalities?: string[];
-        // Vendor's OFFICIAL base_instructions; omit to inherit the neutral
-        // template default. Required by Codex, so the backend always emits one.
-        baseInstructions?: string;
-        // Reasoning efforts the vendor's endpoint actually accepts (subset of
-        // none/minimal/low/medium/high/xhigh/max/ultra). Omit to keep the
-        // template's conservative none/high default. Pre-filled from official
-        // vendor docs; users can still edit per provider in the form.
-        reasoningLevels?: string[];
-        defaultReasoningLevel?: string;
-      }
-  >,
-): CodexCatalogModel[] {
-  return models.map((entry) =>
-    typeof entry === "string"
-      ? { model: entry }
-      : {
-          model: entry.model,
-          displayName: entry.displayName,
-          contextWindow: entry.contextWindow,
-          supportsParallelToolCalls: entry.supportsParallelToolCalls,
-          inputModalities: entry.inputModalities,
-          baseInstructions: entry.baseInstructions,
-          reasoningLevels: entry.reasoningLevels,
-          defaultReasoningLevel: entry.defaultReasoningLevel,
-        },
-  );
-}
-
 export const codexProviderPresets: CodexProviderPreset[] = [
   {
     name: "OpenAI Official",

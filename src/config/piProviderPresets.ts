@@ -47,34 +47,6 @@ export interface PiProviderPreset {
   iconColor?: string;
 }
 
-const OPENAI_COMPLETIONS_COMPAT = {
-  supportsStore: false,
-  supportsDeveloperRole: false,
-  maxTokensField: "max_tokens",
-} as const;
-
-const DEEPSEEK_THINKING_COMPAT = {
-  ...OPENAI_COMPLETIONS_COMPAT,
-  requiresReasoningContentOnAssistantMessages: true,
-  thinkingFormat: "deepseek",
-} as const;
-
-const XIAOMI_THINKING_COMPAT = {
-  requiresReasoningContentOnAssistantMessages: true,
-  thinkingFormat: "deepseek",
-} as const;
-
-const KIMI_K3_COMPAT = {
-  supportsStore: false,
-  supportsDeveloperRole: false,
-  supportsReasoningEffort: true,
-  maxTokensField: "max_tokens",
-  supportsStrictMode: false,
-  thinkingFormat: "openai",
-  requiresReasoningContentOnAssistantMessages: true,
-  deferredToolsMode: "kimi",
-} as const;
-
 /**
  * Pi-native provider catalog.
  *

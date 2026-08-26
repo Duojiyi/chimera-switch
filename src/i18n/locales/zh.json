@@ -1194,7 +1194,7 @@
     "officialHint": "💡 官方供应商使用浏览器登录，无需配置 API Key",
     "providerKeyStatusLoading": "正在加载供应商标识状态，请稍后再试",
     "getApiKey": "获取 API Key",
-    
+
     "presets": {
       "ucloud": "优云智算",
       "ucloudCoding": "优云智算Coding Plan",

@@ -37,25 +37,6 @@ export interface UniversalProviderPreset {
 }
 
 /**
- * NewAPI 默认模型配置
- */
-const NEWAPI_DEFAULT_MODELS: UniversalProviderModels = {
-  claude: {
-    model: "claude-sonnet-5",
-    haikuModel: "claude-haiku-4-5-20251001",
-    sonnetModel: "claude-sonnet-5",
-    opusModel: "claude-opus-5",
-  },
-  codex: {
-    model: "gpt-5.6-sol",
-    reasoningEffort: "high",
-  },
-  gemini: {
-    model: "gemini-3.6-flash",
-  },
-};
-
-/**
  * 统一供应商预设列表
  */
 export const universalProviderPresets: UniversalProviderPreset[] = [

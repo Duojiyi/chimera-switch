@@ -1194,7 +1194,7 @@
     "officialHint": "💡 Official provider uses browser login, no API Key needed",
     "providerKeyStatusLoading": "Provider identifier status is still loading. Please try again shortly.",
     "getApiKey": "Get API Key",
-    
+
     "presets": {
       "ucloud": "Compshare",
       "ucloudCoding": "Compshare Coding Plan",

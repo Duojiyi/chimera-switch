@@ -23,7 +23,6 @@
  */
 import type { ProviderCategory } from "../types";
 import type { CodexApiFormat } from "../types";
-import { GROK_BUILD_DEFAULT_MODEL } from "../utils/grokBuildConfig";
 
 export interface GrokBuildProviderPreset {
   name: string;
@@ -55,28 +54,6 @@ export const grokBuildOfficialPreset: GrokBuildProviderPreset = {
   icon: "grok",
   iconColor: "currentColor",
 };
-
-/** OpenRouter 系命名空间路由站的 Grok 模型 id */
-const OPENROUTER_STYLE_GROK_MODEL = "x-ai/grok-4.5";
-
-const grokAuth = (): Record<string, any> => ({ OPENAI_API_KEY: "" });
-
-function grokPresetConfig(
-  providerName: string,
-  baseUrl: string,
-  model = GROK_BUILD_DEFAULT_MODEL,
-): string {
-  const tomlString = (value: string) => JSON.stringify(value);
-
-  return `model_provider = "custom"
-model = ${tomlString(model)}
-
-[model_providers.custom]
-name = ${tomlString(providerName)}
-base_url = ${tomlString(baseUrl)}
-wire_api = "responses"
-requires_openai_auth = true`;
-}
 
 export const grokBuildProviderPresets: GrokBuildProviderPreset[] = [
   {

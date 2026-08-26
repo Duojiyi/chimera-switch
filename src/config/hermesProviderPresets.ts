@@ -167,9 +167,7 @@ export const hermesProviderPresets: HermesProviderPreset[] = [
       base_url: "https://api.chimerahub.org/v1",
       api_key: "",
       api_mode: "chat_completions",
-      models: [
-        { id: "gpt-5.6-sol", name: "GPT-5.6 SOL" },
-      ],
+      models: [{ id: "gpt-5.6-sol", name: "GPT-5.6 SOL" }],
     },
     category: "third_party",
     icon: "openai",
