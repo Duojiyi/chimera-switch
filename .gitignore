@@ -20,7 +20,7 @@ vitest-report.json
 nul
 
 # Flatpak build artifacts
-flatpak/cc-switch.deb
+flatpak/chimera-switch.deb
 flatpak-build/
 flatpak-repo/
 .worktrees/

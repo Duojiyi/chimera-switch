@@ -136,7 +136,7 @@ Chimera Switch supports three languages. When modifying user-facing text:
 
 # 贡献指南
 
-> [English Version](#contributing-to-cc-switch)
+> [English Version](#contributing-to-chimera-switch)
 
 感谢你对 Chimera Switch 的贡献兴趣！参与之前请阅读我们的[行为准则](./CODE_OF_CONDUCT.md)。
 
