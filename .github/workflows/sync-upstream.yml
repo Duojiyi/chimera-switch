@@ -1,15 +1,25 @@
 name: Sync upstream
 
 # 上游 cc-switch（farion1231/cc-switch）发版后自动同步去广告版：
-#   1. 检测上游最新 release tag；
-#   2. 把该 tag 合并进本 fork 的 main，再重跑去广告脚本 scripts/debrand.mjs（幂等）；
-#   3. 把版本号对齐为上游版本，提交、推送 main，并以同名 tag 打标；
-#      打 tag 会触发 release.yml 全平台构建（去证书签名、保留 minisign 更新签名）。
-# 合并冲突无法自动解决时，放弃合并并开 issue 通知人工处理，不阻塞后续检测。
+#   1. 检测上游最新正式 release tag（releases/latest，不含 prerelease/draft）；
+#   2. 合并该 tag。冲突时先按已知类别自动解决：
+#      - fork 自有文件（tauri.conf.json / README / .github / scripts / 图标等）
+#        取本侧 ours——tauri.conf.json 含 fork 的 identifier、更新器公钥与端点，
+#        绝不能被上游覆盖（check-debrand.mjs 有对应断言兜底）；
+#      - 代码与锁文件（src / src-tauri / tests / docs / package.json / Cargo.* /
+#        pnpm-lock 等）取上游 theirs——debrand.mjs（幂等）随后重新完成
+#        去广告与品牌化；fork 已删除的孤儿测试保持删除；
+#      仍剩未知路径的冲突才放弃合并并开 issue 人工处理（同标题去重）。
+#   3. 质量门禁全部通过才推送：debrand → 版本对齐 → prettier → typecheck →
+#      单测 → check-debrand 守门扫描；随后推 main 并以同名 tag 打标，
+#      触发 release.yml 全平台构建（无证书签名、保留 minisign 更新签名）。
 #
-# 注意：打 tag 必须用 PAT（个人访问令牌）推送才能触发 release.yml——
-# 用默认 GITHUB_TOKEN 推送产生的事件不会再次触发工作流。
-# 请在仓库 Secrets 配置 SYNC_TOKEN（PAT，需 repo / contents:write 权限）。
+# 注意：
+#   - 打 tag 必须用 PAT（Secrets 里的 SYNC_TOKEN，需 repo/contents:write）推送
+#     才能触发 release.yml——默认 GITHUB_TOKEN 推送产生的事件不会触发工作流。
+#   - release.yml 以 prerelease 发布。人工验证后在 Releases 页转正（取消
+#     pre-release），更新器端点 /releases/latest/download/latest.json 才会生效，
+#     同时触发 sync-r2.yml 把产物镜像到下载站。转正是发版的最后一步，别忘了。
 
 on:
   workflow_dispatch:
@@ -35,11 +45,6 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '20'
-
       - name: Add and fetch upstream
         run: |
           git remote add upstream https://github.com/farion1231/cc-switch.git || true
@@ -51,10 +56,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG=$(gh api repos/farion1231/cc-switch/releases --jq '.[0].tag_name' 2>/dev/null || true)
+          # releases/latest 只返回正式版，天然排除 prerelease / draft
+          TAG=$(gh api repos/farion1231/cc-switch/releases/latest --jq '.tag_name' 2>/dev/null || true)
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            # 兜底：只看无预发布后缀的稳定版 tag
             TAG=$(git ls-remote --tags https://github.com/farion1231/cc-switch.git 'v*' \
-              | sed 's#.*refs/tags/##; s#\^{}##' | sort -V | tail -n1)
+              | sed 's#.*refs/tags/##; s#\^{}##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -n1)
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::未能获取上游 release tag"
+            exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Latest upstream release tag: $TAG"
@@ -70,7 +82,21 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Merge upstream and re-debrand
+      - name: Setup Node.js
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        if: steps.check.outputs.skip != 'true'
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+
+      - name: Merge upstream (targeted conflict resolution)
         id: merge
         if: steps.check.outputs.skip != 'true'
         run: |
@@ -81,16 +107,65 @@ jobs:
 
           if git merge --no-edit --no-ff "$TAG"; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
-            # 重跑去广告脚本（幂等），刷新品牌与供应商预设
-            node scripts/debrand.mjs
-            # 版本号与上游 tag 保持一致（仅在必要时改动，保留其它格式）
-            VER="${TAG#v}" node -e 'const fs=require("fs");const v=process.env.VER;for(const p of ["package.json","src-tauri/tauri.conf.json"]){let s=fs.readFileSync(p,"utf8");s=s.replace(/("version"\s*:\s*")[^"]*(")/,"$1"+v+"$2");fs.writeFileSync(p,s);}'
-            git add -A
-            git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
-          else
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
-            git merge --abort || true
+            exit 0
           fi
+
+          echo "合并冲突，按已知类别自动解决…"
+          UNRESOLVED=0
+          while IFS= read -r f; do
+            has_ours=$(git ls-files -u -- "$f" | awk '$3==2' | wc -l)
+            has_theirs=$(git ls-files -u -- "$f" | awk '$3==3' | wc -l)
+            case "$f" in
+              src-tauri/tauri.conf.json|src-tauri/Info.plist|src-tauri/icons/*|README.md|README_*.md|.github/*|scripts/*|assets/*|flatpak/*|deplink.html|CONTRIBUTING.md|SECURITY.md|SUPPORT.md|CODE_OF_CONDUCT.md|.gitignore|.gitattributes|LICENSE)
+                # fork 自有文件：保留本侧（版本号随后由 align-version.mjs 对齐）
+                if [ "$has_ours" -gt 0 ]; then
+                  git checkout --ours -- "$f" && git add -- "$f"
+                  echo "  ours   $f"
+                else
+                  git rm -q -f -- "$f"
+                  echo "  rm     $f"
+                fi ;;
+              package.json|pnpm-lock.yaml|pnpm-workspace.yaml|src-tauri/Cargo.toml|src-tauri/Cargo.lock|src/*|src-tauri/*|tests/*|docs/*|CHANGELOG.md|index.html|session-manager.md|*.config.*|tsconfig*.json|components.json|.node-version|rust-toolchain.toml)
+                # 代码/依赖/文档：取上游，随后 debrand（幂等）重新去广告与品牌化。
+                # 任一侧删除的文件保持删除（fork 删除的孤儿测试 / 上游删除的文件）。
+                if [ "$has_ours" -eq 0 ] || [ "$has_theirs" -eq 0 ]; then
+                  git rm -q -f -- "$f"
+                  echo "  rm     $f"
+                else
+                  git checkout --theirs -- "$f" && git add -- "$f"
+                  echo "  theirs $f"
+                fi ;;
+              *)
+                echo "  ??     $f（无既定策略）"
+                UNRESOLVED=1 ;;
+            esac
+          done < <(git diff --name-only --diff-filter=U)
+
+          if [ "$UNRESOLVED" -ne 0 ]; then
+            echo "存在无法自动解决的冲突路径（见上方 ?? 行），放弃合并。"
+            git merge --abort || true
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit --no-edit
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+
+      - name: Re-debrand, align version and run quality gates
+        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.upstream.outputs.tag }}"
+          node scripts/debrand.mjs
+          node scripts/align-version.mjs "${TAG#v}"
+          # debrand 的品牌替换会拉长部分 Rust 字符串/注释行，rustfmt 收口
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+          pnpm install --frozen-lockfile
+          pnpm format
+          pnpm typecheck
+          pnpm test:unit
+          node scripts/check-debrand.mjs
+          git add -A
+          git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
 
       - name: Push main and tag
         if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
@@ -105,14 +180,47 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG="${{ steps.upstream.outputs.tag }}"
-          gh issue create \
-            --title "sync: 手动合并上游 $TAG" \
-            --body "自动合并上游 $TAG 时产生冲突，需要手动解决。解决后合并到 main 并执行：
+          TITLE="sync: 手动合并上游 $TAG"
+          # 同标题的 open issue 已存在则不再重复创建（冲突期间每 6 小时会重跑）
+          COUNT=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq 'length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "已有同标题 issue，跳过创建。"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "自动合并上游 $TAG 出现无既定策略的冲突路径（见 [运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) 中的 \`??\` 行），需要人工处理。
 
-            \`\`\`
-            git fetch upstream --tags
-            git merge $TAG
-            git tag $TAG && git push origin $TAG
-            \`\`\`" \
-            || true
+          完整手动步骤：
+
+          \`\`\`bash
+          git fetch upstream --tags --force
+          git merge $TAG            # 手动解决冲突
+          node scripts/debrand.mjs
+          node scripts/align-version.mjs ${TAG#v}
+          pnpm install && pnpm format && pnpm typecheck && pnpm test:unit
+          node scripts/check-debrand.mjs
+          git add -A && git commit
+          git push origin main
+          git tag $TAG && git push origin $TAG   # 触发 release 构建
+          \`\`\`
+
+          构建完成并验证后，记得在 Releases 页把该版本从 pre-release 转正，
+          否则更新器端点与下载站镜像（sync-r2）都不会生效。" || true
+
+      - name: Notify failure (non-conflict)
+        if: failure() && steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.upstream.outputs.tag || 'unknown' }}"
+          TITLE="sync: 自动同步 $TAG 失败（非冲突）"
+          COUNT=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq 'length')
+          if [ "$COUNT" -gt 0 ]; then
+            echo "已有同标题 issue，跳过创建。"
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "同步流水线在非冲突环节失败（debrand / 版本对齐 / 格式化 / 类型检查 / 单测 / 守门扫描之一）。
+
+          详见 [运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})。修复后可手动重跑 workflow（Actions → Sync upstream → Run workflow）。" || true

@@ -35,6 +35,7 @@ jobs:
             frontend:
               - "src/**"
               - "tests/**"
+              - "scripts/**"
               - "index.html"
               - "package.json"
               - "pnpm-lock.yaml"
@@ -98,6 +99,9 @@ jobs:
 
       - name: Unit tests
         run: pnpm test:unit
+
+      - name: Debrand guard scan
+        run: node scripts/check-debrand.mjs
 
   backend:
     name: Backend Checks
