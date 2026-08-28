@@ -68,13 +68,9 @@ jobs:
           fi
           if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_REPOSITORY" = "Duojiyi/chimera-switch" ]; then
-            # A silently stale mirror strands updater users on old versions
-            # (the R2 endpoint wins as long as its manifest parses), so the
-            # official repo must never skip this sync.
-            echo "::error::R2 secrets (R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) are missing on the official repo; refusing to skip the mirror sync."
-            exit 1
           else
+            # 本 fork 的更新器端点只有 GitHub releases（tauri.conf.json 未配 R2
+            # 端点），R2 只是可选的下载站镜像——未配置密钥时跳过而非失败。
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "R2 secrets not configured; skipping download mirror sync."
           fi
