@@ -2,7 +2,7 @@ use crate::error::AppError;
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
 
 /// 获取 macOS 上的 .app bundle 路径
-/// 将 `/path/to/CC Switch.app/Contents/MacOS/CC Switch` 转换为 `/path/to/CC Switch.app`
+/// 将 `/path/to/Chimera Switch.app/Contents/MacOS/Chimera Switch` 转换为 `/path/to/Chimera Switch.app`
 #[cfg(target_os = "macos")]
 fn get_macos_app_bundle_path(exe_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let path_str = exe_path.to_string_lossy();
@@ -76,24 +76,26 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_get_macos_app_bundle_path_valid() {
-        let exe_path = std::path::Path::new("/Applications/CC Switch.app/Contents/MacOS/CC Switch");
+        let exe_path =
+            std::path::Path::new("/Applications/Chimera Switch.app/Contents/MacOS/Chimera Switch");
         let result = get_macos_app_bundle_path(exe_path);
         assert_eq!(
             result,
-            Some(std::path::PathBuf::from("/Applications/CC Switch.app"))
+            Some(std::path::PathBuf::from("/Applications/Chimera Switch.app"))
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn test_get_macos_app_bundle_path_with_spaces() {
-        let exe_path =
-            std::path::Path::new("/Users/test/My Apps/CC Switch.app/Contents/MacOS/CC Switch");
+        let exe_path = std::path::Path::new(
+            "/Users/test/My Apps/Chimera Switch.app/Contents/MacOS/Chimera Switch",
+        );
         let result = get_macos_app_bundle_path(exe_path);
         assert_eq!(
             result,
             Some(std::path::PathBuf::from(
-                "/Users/test/My Apps/CC Switch.app"
+                "/Users/test/My Apps/Chimera Switch.app"
             ))
         );
     }

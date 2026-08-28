@@ -1,74 +1,32 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "comment": "Chimera Switch debrand 配置的单一来源。debrand 脚本（debrand.mjs）读取本文件，把每个 App 的预设列表清空为仅保留 ChimeraHub 这一个供应商，并自动填入对应端点与协议格式。改中转站端点/模型只需改这里。",
+  "comment": "Chimera Switch debrand 配置的单一来源。debrand.mjs 从这里读取中转站与默认模型并注入各 App 预设；check-debrand.mjs 从这里读取 identity 做发布前守门断言。改中转站端点/模型只需改这里，然后重跑 node scripts/debrand.mjs。",
   "relay": {
     "name": "ChimeraHub",
     "website": "https://api.chimerahub.org",
-    "apiBase": "https://api.chimerahub.org",
-    "keyField": "OPENAI_API_KEY"
+    "base": "https://api.chimerahub.org/v1"
   },
-  "apps": {
-    "codex": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "openai_responses",
-      "model": "gpt-5.6-sol",
-      "confirmed": true
+  "models": {
+    "openaiChat": {
+      "id": "gpt-5.6-sol",
+      "label": "GPT-5.6 SOL",
+      "contextWindow": 200000
     },
+    "codex": "gpt-5.6-sol",
+    "grok": "grok-4.5",
+    "gemini": "gemini-2.5-pro",
     "claude": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "anthropic",
       "model": "claude-sonnet-4-5",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Anthropic 兼容端点路径"
+      "haiku": "claude-haiku-4-5",
+      "sonnet": "claude-sonnet-4-5",
+      "opus": "claude-opus-4-5"
     },
-    "claude-desktop": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "anthropic",
-      "model": "claude-sonnet-4-5",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Anthropic 兼容端点路径"
-    },
-    "gemini": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "gemini_native",
-      "model": "gemini-2.5-pro",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Gemini 兼容端点路径"
-    },
-    "grokbuild": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "openai_chat",
-      "model": "grok-4.1",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Grok/OpenAI 兼容端点"
-    },
-    "opencode": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "openai_chat",
-      "model": "gpt-5.6",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 OpenCode 端点"
-    },
-    "openclaw": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "openai_chat",
-      "model": "gpt-5.6",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 OpenClaw 端点"
-    },
-    "hermes": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "chat_completions",
-      "model": "gpt-5.6",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Hermes 端点"
-    },
-    "pi": {
-      "base_url": "https://api.chimerahub.org/v1",
-      "apiFormat": "openai_chat",
-      "model": "gpt-5.6",
-      "confirmed": false,
-      "note": "TODO: 确认中转站 Pi 端点"
-    }
+    "piBase": "anthropic/claude-sonnet-5"
+  },
+  "identity": {
+    "identifier": "com.chimerahub.switch",
+    "scheme": "chimeraswitch",
+    "packageName": "chimera-switch",
+    "updaterEndpoint": "https://github.com/Duojiyi/chimera-switch/releases/latest/download/latest.json",
+    "updaterPubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
   }
 }
