@@ -328,13 +328,10 @@ jobs:
             $dest = "Chimera-Switch-$VERSION-Windows$assetSuffix.msi"
             Copy-Item $msi.FullName (Join-Path release-assets $dest)
             Write-Host "Installer copied: $dest"
-            $sigPath = "$($msi.FullName).sig"
-            if (Test-Path $sigPath) {
-              Copy-Item $sigPath (Join-Path release-assets ("$dest.sig"))
-              Write-Host "Signature copied: $dest.sig"
-            } else {
-              throw "Signature not found for $($msi.Name)"
-            }
+             # The build runner uses an ephemeral key only to satisfy Tauri's
+             # bundle step. The protected signer must create the final
+             # signature after this asset has its published name.
+             Write-Host "Temporary build signature intentionally not uploaded: $dest.sig"
           } else {
             throw "No Windows $assetSuffix MSI installer found"
           }
@@ -493,7 +490,7 @@ jobs:
         working-directory: .signing-tooling
         env:
           UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
-        run: node scripts/verify-release-assets.mjs release-assets "${{ env.RELEASE_TAG }}" "${{ github.repository }}" - "$UPDATER_PUBLIC_KEY"
+        run: node scripts/verify-release-assets.mjs release-assets "${{ env.RELEASE_TAG }}" "${{ github.repository }}" - "" --unsigned
 
       - name: Sign updater assets in protected environment
         working-directory: .signing-tooling

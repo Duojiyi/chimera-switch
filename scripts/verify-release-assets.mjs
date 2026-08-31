@@ -2,18 +2,19 @@
 /**
  * Verify the signed updater assets and latest.json for a release.
  *
- * Usage: node scripts/verify-release-assets.mjs <assets-dir> <tag> <owner/repo> [latest.json|-] [tauri-public-key-base64]
+ * Usage: node scripts/verify-release-assets.mjs <assets-dir> <tag> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned]
  */
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 
-const [assetsDir, tag, repo, latestJsonArg, publicKeyBase64] = process.argv.slice(2);
+const [assetsDir, tag, repo, latestJsonArg, publicKeyBase64, verificationMode] = process.argv.slice(2);
 const latestJsonPath = latestJsonArg === "-" ? undefined : latestJsonArg;
+const unsignedMode = verificationMode === "--unsigned";
 const tagPattern = /^v\d+\.\d+\.\d+$/;
 const githubRepoPattern = /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$/;
 if (!assetsDir || !tagPattern.test(tag ?? "") || !githubRepoPattern.test(repo ?? "")) {
-  console.error("Usage: node scripts/verify-release-assets.mjs <assets-dir> <vX.Y.Z> <owner/repo> [latest.json|-] [tauri-public-key-base64]");
+  console.error("Usage: node scripts/verify-release-assets.mjs <assets-dir> <vX.Y.Z> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned]");
   process.exit(1);
 }
 
@@ -52,11 +53,13 @@ const readRegularFile = (file, label) => {
 const signatures = new Map();
 for (const name of Object.values(required)) {
   readRegularFile(path.join(assetsDir, name), name);
-  const signature = readRegularFile(path.join(assetsDir, `${name}.sig`), `${name}.sig`);
-  if (signature) {
-    const text = signature.toString("utf8").trim();
-    if (!text) failures.push(`${name}.sig: empty signature`);
-    else signatures.set(name, text);
+  if (!unsignedMode) {
+    const signature = readRegularFile(path.join(assetsDir, `${name}.sig`), `${name}.sig`);
+    if (signature) {
+      const text = signature.toString("utf8").trim();
+      if (!text) failures.push(`${name}.sig: empty signature`);
+      else signatures.set(name, text);
+    }
   }
 }
 
@@ -161,7 +164,7 @@ const verifyMinisign = (assetPath, signatureText, publicKey) => {
   return true;
 };
 
-if (publicKeyBase64) {
+if (publicKeyBase64 && !unsignedMode) {
   const publicKey = parseMinisignPublicKey(publicKeyBase64);
   if (publicKey) {
     for (const name of Object.values(required)) {
@@ -221,4 +224,8 @@ if (failures.length) {
   for (const failure of failures) console.error(`  - ${failure}`);
   process.exit(1);
 }
-console.log(`[verify-release-assets] OK: ${Object.values(required).length} updater artifacts, signatures, and six platform mappings for ${tag}`);
+console.log(
+  unsignedMode
+    ? `[verify-release-assets] OK: ${Object.values(required).length} unsigned updater artifacts for ${tag}`
+    : `[verify-release-assets] OK: ${Object.values(required).length} updater artifacts, signatures, and six platform mappings for ${tag}`,
+);
