@@ -11,7 +11,7 @@ const files = [
   ["package.json", (text) => JSON.parse(text).version],
   ["src-tauri/tauri.conf.json", (text) => JSON.parse(text).version],
   ["src-tauri/Cargo.toml", (text) => text.match(/^version\s*=\s*"([^"]+)"/m)?.[1]],
-  ["src-tauri/Cargo.lock", (text) => text.match(/name = "chimera-switch"\nversion = "([^"]+)"/)?.[1]],
+  ["src-tauri/Cargo.lock", (text) => text.match(/name = "chimera-switch"\r?\nversion = "([^"]+)"/)?.[1]],
 ];
 const failures = [];
 for (const [file, readVersion] of files) {
