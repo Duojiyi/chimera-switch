@@ -100,13 +100,41 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+          set +e
+          origin_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" 2>/dev/null)
+          origin_status=$?
+          set -e
+          if [ "$origin_status" -ne 0 ] && [ "$origin_status" -ne 2 ]; then
+            echo "::error::Could not inspect origin tag $TAG (git ls-remote exit $origin_status)."
+            exit 1
+          fi
+          if [ -z "$origin_refs" ]; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "Tag $TAG is not on origin; a normal upstream sync is required."
             exit 0
           fi
 
-          echo "Tag $TAG already exists on origin. Checking whether its Release is complete."
+          origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v tag_ref="refs/tags/$TAG^{}" '$2 == tag_ref { print $1; exit }')
+          if [ -z "$origin_tag_sha" ]; then
+            origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v tag_ref="refs/tags/$TAG" '$2 == tag_ref { print $1; exit }')
+          fi
+          if ! printf '%s' "$origin_tag_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Could not resolve immutable origin commit for tag $TAG"
+            exit 1
+          fi
+          # The local release tag points to the post-sync commit, which includes
+          # debranding and quality-gate changes after the upstream commit. It is
+          # therefore expected to differ from the upstream tag SHA. Verify the
+          # immutable tag instead by requiring the upstream commit in its history.
+          if ! git cat-file -e "$origin_tag_sha^{commit}" 2>/dev/null; then
+            git fetch --quiet --no-tags origin "$origin_tag_sha"
+          fi
+          if ! git merge-base --is-ancestor "${{ steps.upstream.outputs.sha }}" "$origin_tag_sha"; then
+            echo "::error::Origin tag $TAG points to $origin_tag_sha without upstream commit ${{ steps.upstream.outputs.sha }} in its history; refusing to treat it as this upstream release."
+            exit 1
+          fi
+
+          echo "Tag $TAG already exists at immutable commit $origin_tag_sha and contains the upstream release commit. Checking whether its Release is complete."
           release_data=$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)
           ready=true
           if [ -z "$release_data" ] || [ "$(printf '%s' "$release_data" | jq -r '.isDraft')" != false ]; then
@@ -149,8 +177,8 @@ jobs:
           recovery_run_id=""
           for attempt in $(seq 1 30); do
             recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event workflow_dispatch --limit 20 \
-              --json databaseId,createdAt --jq --argjson since "$dispatched_at" \
-              'map(select((.createdAt | fromdateiso8601) >= $since)) | .[0].databaseId // empty' || true)
+              --json databaseId,createdAt \
+              --jq "map(select((.createdAt | fromdateiso8601) >= $dispatched_at)) | .[0].databaseId // empty" || true)
             if [ -n "$recovery_run_id" ]; then
               break
             fi
@@ -170,7 +198,7 @@ jobs:
 
       - name: Setup Node.js
         if: steps.check.outputs.skip != 'true'
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '20'
 
