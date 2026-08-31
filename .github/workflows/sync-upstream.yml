@@ -1,35 +1,18 @@
 name: Sync upstream
 
-# 上游 cc-switch（farion1231/cc-switch）发版后自动同步去广告版：
-#   1. 检测上游最新正式 release tag（releases/latest，不含 prerelease/draft）；
-#   2. 合并该 tag。冲突时先按已知类别自动解决：
-#      - fork 自有文件（tauri.conf.json / README / .github / scripts / 图标等）
-#        取本侧 ours——tauri.conf.json 含 fork 的 identifier、更新器公钥与端点，
-#        绝不能被上游覆盖（check-debrand.mjs 有对应断言兜底）；
-#      - 代码与锁文件（src / src-tauri / tests / docs / package.json / Cargo.* /
-#        pnpm-lock 等）取上游 theirs——debrand.mjs（幂等）随后重新完成
-#        去广告与品牌化；fork 已删除的孤儿测试保持删除；
-#      仍剩未知路径的冲突才放弃合并并开 issue 人工处理（同标题去重）。
-#   3. 质量门禁全部通过才推送：debrand → 版本对齐 → prettier → typecheck →
-#      单测 → check-debrand 守门扫描；随后推 main 并以同名 tag 打标，
-#      触发 release.yml 全平台构建（无证书签名、保留 minisign 更新签名）。
-#
-# 注意：
-#   - 打 tag 必须用 PAT（Secrets 里的 SYNC_TOKEN，需 repo/contents:write）推送
-#     才能触发 release.yml——默认 GITHUB_TOKEN 推送产生的事件不会触发工作流。
-#   - release.yml 以 prerelease 发布。人工验证后在 Releases 页转正（取消
-#     pre-release），更新器端点 /releases/latest/download/latest.json 才会生效，
-#     同时触发 sync-r2.yml 把产物镜像到下载站。转正是发版的最后一步，别忘了。
+# 上游 cc-switch（farion1231/cc-switch）发版后自动同步去广告版。
+# 同步使用 SYNC_TOKEN：必须能读写本仓库 Contents/Workflows，若保留 issue 通知还需
+# Issues 写权限。默认 GITHUB_TOKEN 不会触发本仓库后续的 tag release workflow。
+# release.yml 先以 prerelease 发布；完成人工验收后再转正，届时 sync-r2.yml 才会
+# 更新公开的 latest.json 和下载站根 manifest。
 
 on:
   workflow_dispatch:
   schedule:
-    # 每 6 小时检测一次（UTC）
     - cron: '17 */6 * * *'
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: sync-upstream
@@ -39,73 +22,194 @@ jobs:
   sync:
     runs-on: ubuntu-22.04
     steps:
+      - name: Validate sync token
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::SYNC_TOKEN is missing. Configure a repository-scoped PAT with Contents and Workflows write permission."
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $SYNC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPOSITORY" >/dev/null
+          scopes=$(curl --fail --silent --show-error --dump-header - -o /dev/null \
+            -H "Authorization: Bearer $SYNC_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user | awk -F': ' 'tolower($1) == "x-oauth-scopes" {print tolower($2)}' | tr -d '\r')
+          # Classic OAuth/PAT tokens expose scopes. Fine-grained PATs do not, so
+          # an empty header is accepted and the real push/dispatch remains the final check.
+          if [ -n "$scopes" ] && ! printf '%s' "$scopes" | tr ',' '\n' | sed 's/^ *//' | grep -qx workflow; then
+            echo "::error::SYNC_TOKEN is a classic token without the workflow scope (scopes: $scopes)."
+            echo "Create a fine-grained PAT with Contents: Read and write and Workflows: Read and write, then replace the SYNC_TOKEN secret."
+            exit 1
+          fi
+          echo "SYNC_TOKEN can access $REPOSITORY"
+
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN }}
+          # Do not leave the write-capable token in .git/config while upstream
+          # code is installed, formatted, typechecked, or tested.
+          persist-credentials: false
 
       - name: Add and fetch upstream
         run: |
-          git remote add upstream https://github.com/farion1231/cc-switch.git || true
+          set -euo pipefail
+          git remote add upstream https://github.com/farion1231/cc-switch.git 2>/dev/null || true
           git fetch upstream --tags --prune --force
 
       - name: Detect latest upstream release tag
         id: upstream
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           set -euo pipefail
-          # releases/latest 只返回正式版，天然排除 prerelease / draft
-          TAG=$(gh api repos/farion1231/cc-switch/releases/latest --jq '.tag_name' 2>/dev/null || true)
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            # 兜底：只看无预发布后缀的稳定版 tag
-            TAG=$(git ls-remote --tags https://github.com/farion1231/cc-switch.git 'v*' \
-              | sed 's#.*refs/tags/##; s#\^{}##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -V | tail -n1)
-          fi
-          if [ -z "$TAG" ]; then
-            echo "::error::未能获取上游 release tag"
+          # /releases/latest is the upstream stable-release source of truth.
+          # If GitHub API resolution fails, stop loudly instead of guessing from
+          # tags, because a tag can exist without being a published stable release.
+          release=$(gh api repos/farion1231/cc-switch/releases/latest)
+          TAG=$(printf '%s' "$release" | jq -r '.tag_name // empty')
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Latest upstream release has no valid stable tag (received: $TAG)"
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream release tag: $TAG"
-
-      - name: Skip if already synced
-        id: check
-        run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
-          if [ -n "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
-            echo "Tag $TAG already exists on origin — nothing to do."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+          if [ "$(printf '%s' "$release" | jq -r '.draft')" != false ] || [ "$(printf '%s' "$release" | jq -r '.prerelease')" != false ]; then
+            echo "::error::Upstream latest release $TAG is draft/prerelease; refusing automatic sync."
+            exit 1
           fi
+          UPSTREAM_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if ! printf '%s' "$UPSTREAM_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::Could not resolve immutable upstream commit for $TAG"
+            exit 1
+          fi
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream stable release: $TAG ($UPSTREAM_SHA)"
+
+      - name: Check existing tag and release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG is not on origin; a normal upstream sync is required."
+            exit 0
+          fi
+
+          echo "Tag $TAG already exists on origin. Checking whether its Release is complete."
+          release_data=$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)
+          ready=true
+          if [ -z "$release_data" ] || [ "$(printf '%s' "$release_data" | jq -r '.isDraft')" != false ]; then
+            ready=false
+          fi
+          required=(
+            "Chimera-Switch-$TAG-macOS.tar.gz"
+            "Chimera-Switch-$TAG-macOS.tar.gz.sig"
+            "Chimera-Switch-$TAG-Windows.msi"
+            "Chimera-Switch-$TAG-Windows.msi.sig"
+            "Chimera-Switch-$TAG-Windows-arm64.msi"
+            "Chimera-Switch-$TAG-Windows-arm64.msi.sig"
+            "Chimera-Switch-$TAG-Linux-x86_64.AppImage"
+            "Chimera-Switch-$TAG-Linux-x86_64.AppImage.sig"
+            "Chimera-Switch-$TAG-Linux-arm64.AppImage"
+            "Chimera-Switch-$TAG-Linux-arm64.AppImage.sig"
+            "latest.json"
+          )
+          for asset in "${required[@]}"; do
+            if ! printf '%s' "$release_data" | jq -e --arg asset "$asset" '.assets[].name | select(. == $asset)' >/dev/null; then
+              echo "Missing Release asset: $asset"
+              ready=false
+            fi
+          done
+          if [ "$ready" = true ]; then
+            if [ "$(printf '%s' "$release_data" | jq -r '.isPrerelease')" = true ]; then
+              echo "Release $TAG is complete but remains a prerelease; manual promotion is required."
+              echo "prerelease_ready=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release $TAG is complete and stable; nothing to do."
+              echo "prerelease_ready=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Release $TAG is missing or incomplete; dispatching release.yml recovery."
+          dispatched_at=$(date -u +%s)
+          gh workflow run release.yml --repo "$REPOSITORY" --ref main -f tag="$TAG"
+          recovery_run_id=""
+          for attempt in $(seq 1 30); do
+            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event workflow_dispatch --limit 20 \
+              --json databaseId,createdAt --jq --argjson since "$dispatched_at" \
+              'map(select((.createdAt | fromdateiso8601) >= $since)) | .[0].databaseId // empty' || true)
+            if [ -n "$recovery_run_id" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$recovery_run_id" ]; then
+            echo "::error::Recovery workflow was dispatched but no run appeared within 60 seconds."
+            exit 1
+          fi
+          echo "Recovery workflow $recovery_run_id started; waiting for its actual result."
+          if ! gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status; then
+            echo "::error::Recovery workflow $recovery_run_id failed; upstream sync is incomplete."
+            exit 1
+          fi
+          echo "Recovery workflow $recovery_run_id completed successfully; upstream sync is complete."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         if: steps.check.outputs.skip != 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
 
       - name: Setup pnpm
         if: steps.check.outputs.skip != 'true'
         env:
-          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         run: |
+          set -euo pipefail
           corepack enable
           corepack install
 
       - name: Merge upstream (targeted conflict resolution)
         id: merge
         if: steps.check.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          TAG="${{ steps.upstream.outputs.tag }}"
+          BASE_SHA=$(git rev-parse HEAD)
 
-          if git merge --no-edit --no-ff "$TAG"; then
+          restore_trusted_paths() {
+            # Keep automation and release tooling from the checked-out origin
+            # baseline. This also removes newly added upstream files in these
+            # directories, not only conflicting files.
+            git rm -r -q --ignore-unmatch .github scripts || true
+            git checkout "$BASE_SHA" -- .github scripts
+            git add .github scripts
+            if ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+              echo "Restored trusted .github and scripts from $BASE_SHA"
+            fi
+          }
+
+          if git merge --no-edit --no-ff "$UPSTREAM_SHA"; then
+            restore_trusted_paths
             echo "conflict=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -117,7 +221,6 @@ jobs:
             has_theirs=$(git ls-files -u -- "$f" | awk '$3==3' | wc -l)
             case "$f" in
               src-tauri/tauri.conf.json|src-tauri/Info.plist|src-tauri/icons/*|README.md|README_*.md|.github/*|scripts/*|assets/*|flatpak/*|deplink.html|CONTRIBUTING.md|SECURITY.md|SUPPORT.md|CODE_OF_CONDUCT.md|.gitignore|.gitattributes|LICENSE)
-                # fork 自有文件：保留本侧（版本号随后由 align-version.mjs 对齐）
                 if [ "$has_ours" -gt 0 ]; then
                   git checkout --ours -- "$f" && git add -- "$f"
                   echo "  ours   $f"
@@ -126,8 +229,6 @@ jobs:
                   echo "  rm     $f"
                 fi ;;
               package.json|pnpm-lock.yaml|pnpm-workspace.yaml|src-tauri/Cargo.toml|src-tauri/Cargo.lock|src/*|src-tauri/*|tests/*|docs/*|CHANGELOG.md|index.html|session-manager.md|*.config.*|tsconfig*.json|components.json|.node-version|rust-toolchain.toml)
-                # 代码/依赖/文档：取上游，随后 debrand（幂等）重新去广告与品牌化。
-                # 任一侧删除的文件保持删除（fork 删除的孤儿测试 / 上游删除的文件）。
                 if [ "$has_ours" -eq 0 ] || [ "$has_theirs" -eq 0 ]; then
                   git rm -q -f -- "$f"
                   echo "  rm     $f"
@@ -142,22 +243,23 @@ jobs:
           done < <(git diff --name-only --diff-filter=U)
 
           if [ "$UNRESOLVED" -ne 0 ]; then
-            echo "存在无法自动解决的冲突路径（见上方 ?? 行），放弃合并。"
+            echo "存在无法自动解决的冲突路径，放弃合并。"
             git merge --abort || true
             echo "conflict=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git commit --no-edit
+          restore_trusted_paths
           echo "conflict=false" >> "$GITHUB_OUTPUT"
 
       - name: Re-debrand, align version and run quality gates
         if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.upstream.outputs.tag }}"
           node scripts/debrand.mjs
           node scripts/align-version.mjs "${TAG#v}"
-          # debrand 的品牌替换会拉长部分 Rust 字符串/注释行，rustfmt 收口
           cargo fmt --manifest-path src-tauri/Cargo.toml
           pnpm install --frozen-lockfile
           pnpm format
@@ -167,60 +269,71 @@ jobs:
           git add -A
           git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
 
-      - name: Push main and tag
+      - name: Push main and immutable tag from a clean repository
         if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          TAG="${{ steps.upstream.outputs.tag }}"
-          git push origin main
-          git tag -f "$TAG" HEAD
-          git push origin "$TAG"
+          set -euo pipefail
+          local_sha=$(git rev-parse HEAD)
+          refs=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          if [ -z "$remote_sha" ]; then
+            remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          fi
+
+          # Check the immutable release tag before changing main, so a conflict
+          # cannot leave the repository half-updated.
+          if [ -n "$remote_sha" ] && [ "$remote_sha" != "$local_sha" ]; then
+            echo "::error::Tag $TAG already exists at $remote_sha, refusing to overwrite it (local HEAD: $local_sha)."
+            exit 1
+          fi
+
+          # Do not push from the checkout that processed upstream-controlled files.
+          # A fresh repository has no upstream remote, checkout config, or hooks.
+          push_root=$(mktemp -d)
+          trap 'rm -rf "$push_root"' EXIT
+          push_repo="$push_root/repository"
+          git init --quiet "$push_repo"
+          git -C "$push_repo" config user.name "github-actions[bot]"
+          git -C "$push_repo" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$push_repo" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$push_repo" -c protocol.file.allow=always fetch --quiet --no-tags "$GITHUB_WORKSPACE" HEAD
+          git -C "$push_repo" switch --quiet --create main FETCH_HEAD
+          if [ -n "$remote_sha" ]; then
+            echo "Tag $TAG already points at $remote_sha; pushing main only."
+            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" push --atomic origin main
+          else
+            git -C "$push_repo" tag "$TAG" HEAD
+            # Update main and create the new tag as one remote transaction.
+            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" push --atomic origin main "refs/tags/$TAG"
+          fi
 
       - name: Notify conflict
         if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'true'
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.upstream.outputs.tag }}"
           TITLE="sync: 手动合并上游 $TAG"
-          # 同标题的 open issue 已存在则不再重复创建（冲突期间每 6 小时会重跑）
-          COUNT=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq 'length')
-          if [ "$COUNT" -gt 0 ]; then
-            echo "已有同标题 issue，跳过创建。"
-            exit 0
-          fi
-          gh issue create --title "$TITLE" --body "自动合并上游 $TAG 出现无既定策略的冲突路径（见 [运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) 中的 \`??\` 行），需要人工处理。
-
-          完整手动步骤：
-
-          \`\`\`bash
-          git fetch upstream --tags --force
-          git merge $TAG            # 手动解决冲突
-          node scripts/debrand.mjs
-          node scripts/align-version.mjs ${TAG#v}
-          pnpm install && pnpm format && pnpm typecheck && pnpm test:unit
-          node scripts/check-debrand.mjs
-          git add -A && git commit
-          git push origin main
-          git tag $TAG && git push origin $TAG   # 触发 release 构建
-          \`\`\`
-
-          构建完成并验证后，记得在 Releases 页把该版本从 pre-release 转正，
-          否则更新器端点与下载站镜像（sync-r2）都不会生效。" || true
+          COUNT=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number --jq 'length' || echo 0)
+          if [ "$COUNT" -gt 0 ]; then exit 0; fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "自动合并上游 $TAG 出现无既定策略的冲突路径，需要人工处理。\n\n运行日志：$RUN_URL"
 
       - name: Notify failure (non-conflict)
         if: failure() && steps.check.outputs.skip != 'true'
+        continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.upstream.outputs.tag || 'unknown' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.upstream.outputs.tag || 'unknown' }}"
           TITLE="sync: 自动同步 $TAG 失败（非冲突）"
-          COUNT=$(gh issue list --state open --search "\"$TITLE\" in:title" --json number --jq 'length')
-          if [ "$COUNT" -gt 0 ]; then
-            echo "已有同标题 issue，跳过创建。"
-            exit 0
-          fi
-          gh issue create --title "$TITLE" --body "同步流水线在非冲突环节失败（debrand / 版本对齐 / 格式化 / 类型检查 / 单测 / 守门扫描之一）。
-
-          详见 [运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})。修复后可手动重跑 workflow（Actions → Sync upstream → Run workflow）。" || true
+          COUNT=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number --jq 'length' || echo 0)
+          if [ "$COUNT" -gt 0 ]; then exit 0; fi
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "同步流水线在质量门禁或推送环节失败。\n\n运行日志：$RUN_URL"

@@ -13,10 +13,11 @@
 #
 # Caveat (by design of tauri-plugin-updater): the updater stops at the first
 # endpoint whose response parses, so a stale-but-valid R2 manifest would mask
-# newer GitHub releases. That is why this sync hard-fails on the official
-# repo when the R2 secrets are missing, instead of silently skipping.
+# newer GitHub releases. R2 is an optional mirror: missing credentials produce
+# a visible warning but never block the GitHub release. Configure the secrets
+# before promoting releases when the public mirror is enabled.
 #
-# Required secrets: R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+# Optional secrets: R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
 name: Sync release to R2
 
 on:
@@ -33,23 +34,23 @@ on:
 permissions:
   contents: read
 
-# latest.json / manifest.json are last-writer-wins — serialize runs and keep
-# every trigger queued instead of the default replace-the-pending behavior.
+# latest.json / manifest.json are last-writer-wins — serialize runs.
+# GitHub Actions keeps one running and one pending run per group; additional
+# triggers are coalesced, so each run must be idempotent and re-check latest.
 concurrency:
   group: sync-r2
   cancel-in-progress: false
-  queue: max
 
 jobs:
   sync-to-r2:
+    # Stable releases only. A prerelease must never move the public mirror.
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     name: Sync release to R2
     runs-on: ubuntu-22.04
     env:
       R2_BUCKET: chimera-switch-releases
       R2_PUBLIC_BASE_URL: https://dl.chimerahub.org
       KEEP_VERSIONS: "5"
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: auto
       # aws-cli >= 2.23 defaults to CRC checksums that R2 rejects.
       AWS_REQUEST_CHECKSUM_CALCULATION: when_required
@@ -57,23 +58,44 @@ jobs:
       R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Release tag must match vX.Y.Z (received: ${TAG:-empty})"
+            exit 1
+          fi
+
+      - name: Validate stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease 2>/dev/null || true)
+          if [ -z "$release" ] || [ "$(printf '%s' "$release" | jq -r '.isDraft')" != false ] || [ "$(printf '%s' "$release" | jq -r '.isPrerelease')" != false ]; then
+            echo "::error::$TAG is not a published stable GitHub Release; refusing R2 sync."
+            exit 1
+          fi
+
       - name: Check R2 secrets
         id: r2
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
+          set -euo pipefail
           if [ -z "$TAG" ]; then
             echo "::error::No release tag to sync."
             exit 1
           fi
-          if [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
-            # 本 fork 的更新器端点只有 GitHub releases（tauri.conf.json 未配 R2
-            # 端点），R2 只是可选的下载站镜像——未配置密钥时跳过而非失败。
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "::warning::R2 secrets are not fully configured; skipping the optional R2 mirror."
+            echo "Configure R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY to enable it."
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "R2 secrets not configured; skipping download mirror sync."
+            exit 0
           fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       # Only the tag that IS GitHub's releases/latest may touch the bucket-root
       # manifests or prune old versions. This keeps manual backfills of old
@@ -114,11 +136,22 @@ jobs:
             echo "::warning::$TAG is not the latest stable release ($latest); syncing versioned files only — root manifests and pruning are skipped."
           fi
 
-      - name: Checkout scripts
-        if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
-        uses: actions/checkout@v6
+      - name: Checkout trusted mirror scripts
+        if: steps.r2.outputs.configured == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          # Release assets are data; do not execute scripts from the release tag.
+          # Use the default branch's reviewed tooling for all mirror generation.
+          ref: main
+          path: .release-scripts
           sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Setup Node.js
+        if: steps.r2.outputs.configured == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '20'
 
       - name: Download release assets
         if: steps.r2.outputs.configured == 'true'
@@ -129,6 +162,7 @@ jobs:
           mkdir -p r2-assets
           gh release download "$TAG" --dir r2-assets --repo "$GITHUB_REPOSITORY"
           ls -la r2-assets
+          node .release-scripts/scripts/verify-release-assets.mjs r2-assets "$TAG" "$GITHUB_REPOSITORY" r2-assets/latest.json "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
 
       - name: Generate download manifest
         if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
@@ -137,32 +171,52 @@ jobs:
         run: |
           set -euo pipefail
           pub_date=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)
-          node scripts/generate-download-manifest.mjs r2-assets "$TAG" "$R2_PUBLIC_BASE_URL" manifest.json "$pub_date"
+          node .release-scripts/scripts/generate-download-manifest.mjs r2-assets "$TAG" "$R2_PUBLIC_BASE_URL" manifest.json "$pub_date"
 
       - name: Rewrite updater manifest for R2
         if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
         run: |
           set -euo pipefail
-          node scripts/rewrite-updater-manifest.mjs r2-assets/latest.json "$TAG" "$R2_PUBLIC_BASE_URL" latest-r2.json
+          node .release-scripts/scripts/rewrite-updater-manifest.mjs r2-assets/latest.json "$TAG" "$GITHUB_REPOSITORY" "$R2_PUBLIC_BASE_URL" latest-r2.json
 
       - name: Upload versioned assets to R2
         if: steps.r2.outputs.configured == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          # Versioned asset paths never change — cache hard at the edge.
-          # .tar.gz is the macOS updater payload; .sig files are not needed
-          # (signatures are embedded in latest.json) and latest.json goes to
-          # the bucket root with a short TTL instead.
-          aws s3 cp r2-assets "s3://$R2_BUCKET/$TAG/" \
-            --recursive \
-            --exclude "*.sig" --exclude "latest.json" \
-            --cache-control "public, max-age=31536000, immutable" \
-            --endpoint-url "$R2_ENDPOINT"
+          # Versioned paths are write-once. Existing objects must carry the
+          # same SHA-256 metadata; never overwrite a published version.
+          shopt -s nullglob
+          for file in r2-assets/*; do
+            name=$(basename "$file")
+            case "$name" in
+              *.sig|latest.json) continue ;;
+            esac
+            key="$TAG/$name"
+            sha=$(sha256sum "$file" | awk '{print $1}')
+            if head=$(aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT" 2>/dev/null); then
+              remote_sha=$(printf '%s' "$head" | jq -r '.Metadata.sha256 // empty')
+              if [ "$remote_sha" != "$sha" ]; then
+                echo "::error::R2 object $key already exists with a different SHA-256; refusing overwrite."
+                exit 1
+              fi
+              echo "Preserving identical immutable R2 object: $key"
+              continue
+            fi
+            aws s3 cp "$file" "s3://$R2_BUCKET/$key" \
+              --metadata "sha256=$sha" \
+              --cache-control "public, max-age=31536000, immutable" \
+              --endpoint-url "$R2_ENDPOINT"
+          done
 
       - name: Publish root manifests to R2
         if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           # Re-verify right before touching the root manifests: a newer
@@ -202,6 +256,9 @@ jobs:
 
       - name: Prune old versions
         if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           versions=$(aws s3 ls "s3://$R2_BUCKET/" --endpoint-url "$R2_ENDPOINT" \

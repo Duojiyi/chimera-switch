@@ -1,0 +1,64 @@
+name: Promote release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Complete prerelease tag to promote (e.g. v3.20.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: promote-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote verified prerelease
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - name: Checkout trusted verification tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '20'
+
+      - name: Download and verify every prerelease asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! printf "%s" "$TAG" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
+            echo "::error::Tag must match vX.Y.Z"
+            exit 1
+          fi
+          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)
+          if [ "$(printf "%s" "$release" | jq -r .isDraft)" != false ] || [ "$(printf "%s" "$release" | jq -r .isPrerelease)" != true ]; then
+            echo "::error::$TAG must be an existing prerelease, not a draft or stable release."
+            exit 1
+          fi
+          rm -rf release-assets
+          mkdir -p release-assets
+          # Download without a pattern so verification sees the complete release.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          node scripts/verify-release-assets.mjs release-assets "$TAG" "$GITHUB_REPOSITORY" release-assets/latest.json "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
+
+      - name: Promote only after verification
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          echo "Promoted $TAG to the latest stable release."
