@@ -72,7 +72,16 @@ jobs:
           - os: macos-14
 
     steps:
-      - name: Checkout release scripts
+      # Checkout the immutable release source first. A checkout action clears its
+      # destination before initializing Git, so the trusted tooling checkout must
+      # be created afterward in a separate path.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate-release.outputs.sha }}
+          persist-credentials: false
+
+      - name: Checkout trusted release scripts
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # Keep validation and artifact tooling on the reviewed default branch so
@@ -80,14 +89,6 @@ jobs:
           ref: main
           path: .release-scripts
           sparse-checkout: scripts
-          persist-credentials: false
-
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.validate-release.outputs.sha }}
-          # Preserve the trusted tooling checkout above; the default clean would remove it.
-          clean: false
           persist-credentials: false
 
       - name: Verify source version
