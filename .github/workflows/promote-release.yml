@@ -36,22 +36,14 @@ env:
   UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
 
 jobs:
-  resolve-release:
-    name: Resolve and verify release provenance
+  request:
+    name: Validate promotion request
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      actions: read
     outputs:
-      tag: ${{ steps.verify.outputs.tag }}
+      tag: ${{ steps.request.outputs.tag }}
       request_id: ${{ steps.request.outputs.request_id }}
-      release_id: ${{ steps.resolve.outputs.release_id }}
-      source_sha: ${{ steps.resolve.outputs.source_sha }}
-      release_tooling_sha: ${{ steps.verify.outputs.release_tooling_sha }}
-      verification_tooling_sha: ${{ steps.resolve.outputs.verification_tooling_sha }}
-      workflow_run_id: ${{ steps.verify.outputs.workflow_run_id }}
-      workflow_run_attempt: ${{ steps.verify.outputs.workflow_run_attempt }}
-      asset_snapshot_sha256: ${{ steps.verify.outputs.asset_snapshot_sha256 }}
       mode: ${{ steps.request.outputs.mode }}
     steps:
       - name: Validate request and correlation id
@@ -80,16 +72,33 @@ jobs:
             echo "::error::request_id must be 8-128 characters of [A-Za-z0-9._-]"
             exit 1
           }
-          printf 'request_id=%s\nmode=%s\n' "$request_id" "$mode" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nrequest_id=%s\nmode=%s\n' "$TAG" "$request_id" "$mode" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve immutable release state
-        id: resolve
+  stage-draft:
+    name: Isolate draft release bytes
+    if: needs.request.outputs.mode == 'promote'
+    needs: request
+    runs-on: ubuntu-22.04
+    environment: release
+    # GitHub hides drafts from read-only tokens. This job has no checkout and
+    # never executes release bytes or repository code while holding write access.
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.stage.outputs.release_id }}
+      source_sha: ${{ steps.stage.outputs.source_sha }}
+      verification_tooling_sha: ${{ steps.stage.outputs.verification_tooling_sha }}
+      release_phase: ${{ steps.stage.outputs.release_phase }}
+      artifact_name: ${{ steps.stage.outputs.artifact_name }}
+    steps:
+      - name: Stage draft or previously published release
+        id: stage
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MODE: ${{ steps.request.outputs.mode }}
           RUN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          umask 077
           main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
           printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve protected main"; exit 1; }
           [ "$main_sha" = "$RUN_SHA" ] || { echo "::error::Protected main moved ($main_sha != $RUN_SHA); rerun from the new tip"; exit 1; }
@@ -112,139 +121,364 @@ jobs:
           printf '%s' "$release_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Release returned an invalid id"; exit 1; }
           expected_title="Chimera Switch $TAG"
           marker='<!-- chimera-automated-release-draft:v1 -->'
-          if [ "$MODE" = repair ]; then
-            printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" '
-              .id == $id and .tag_name == $tag
-              and .draft == false and .prerelease == false
-              and .immutable == true and (.published_at != null)
-            ' >/dev/null || { echo "::error::$TAG must be the expected immutable stable release for R2 repair"; exit 1; }
+          if printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == true and .prerelease == false
+            and .name == $title and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null; then
+            release_phase=draft
+          elif printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+            and .name == $title and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null; then
+            release_phase=published
           else
-            printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-              .id == $id
-              and .tag_name == $tag
-              and .draft == true
-              and .prerelease == false
-              and .name == $title
-              and .author.login == "github-actions[bot]"
-              and ((.body // "") | contains($marker))
-            ' >/dev/null || { echo "::error::$TAG is not the expected bot-owned complete draft"; exit 1; }
+            echo "::error::$TAG is neither the expected bot-owned draft nor its immutable published state"
+            exit 1
           fi
-          printf 'release_id=%s\nsource_sha=%s\nverification_tooling_sha=%s\n' "$release_id" "$source_sha" "$main_sha" >> "$GITHUB_OUTPUT"
 
+          rm -rf promotion-stage
+          mkdir -p promotion-stage/release-assets
+          printf '%s' "$release" > promotion-stage/release.json
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > promotion-stage/release-asset-snapshot.json
+          jq -e '
+            length > 0
+            and all(.[];
+              (.id | type == "number") and .id > 0
+              and ((.name | type) == "string")
+              and (.name | test("^[A-Za-z0-9][A-Za-z0-9._+-]*$"))
+              and (.size | type == "number") and .size > 0
+              and .state == "uploaded"
+              and ((.digest | type) == "string")
+              and (.digest | test("^sha256:[0-9a-f]{64}$")))
+            and ((map(.id) | length) == (map(.id) | unique | length))
+            and ((map(.name) | length) == (map(.name) | unique | length))
+          ' promotion-stage/release-asset-snapshot.json >/dev/null || { echo "::error::Release asset metadata is unsafe or incomplete"; exit 1; }
+          expected_assets=()
+          for suffix in \
+            Linux-arm64.AppImage \
+            Linux-arm64.deb \
+            Linux-arm64.rpm \
+            Linux-x86_64.AppImage \
+            Linux-x86_64.deb \
+            Linux-x86_64.rpm \
+            macOS.dmg \
+            macOS.tar.gz \
+            macOS.zip \
+            Windows-arm64-Portable.zip \
+            Windows-arm64.msi \
+            Windows-Portable.zip \
+            Windows.msi
+          do
+            expected_assets+=("Chimera-Switch-$TAG-$suffix" "Chimera-Switch-$TAG-$suffix.sig")
+          done
+          expected_assets+=(latest.json provenance.json provenance.json.sig)
+          printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort > expected-assets.txt
+          jq -r '.[].name' promotion-stage/release-asset-snapshot.json | LC_ALL=C sort > actual-assets.txt
+          cmp -s expected-assets.txt actual-assets.txt || {
+            echo "::error::Release assets do not match the fixed 29-file publication contract"
+            diff -u expected-assets.txt actual-assets.txt || true
+            exit 1
+          }
+          rm -f expected-assets.txt actual-assets.txt
+          jq -e 'all(.[]; .size <= 268435456) and ([.[].size] | add <= 1073741824)' \
+            promotion-stage/release-asset-snapshot.json >/dev/null || {
+              echo "::error::Release assets exceed the 256 MiB per-file or 1 GiB total staging limits"
+              exit 1
+            }
+          while IFS=$'\t' read -r asset_id name; do
+            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "promotion-stage/release-assets/$name"
+            [ -s "promotion-stage/release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          (cd promotion-stage && sha256sum release-assets/* | sort -k2 > downloaded-sha256.txt)
+          jq -n --arg tag "$TAG" --argjson release_id "$release_id" --arg source_sha "$source_sha" \
+            --arg verification_tooling_sha "$main_sha" --arg release_phase "$release_phase" \
+            '{tag:$tag,releaseId:$release_id,sourceSha:$source_sha,verificationToolingSha:$verification_tooling_sha,releasePhase:$release_phase}' \
+            > promotion-stage/stage-metadata.json
+
+          final_release=$(gh api "repos/$REPOSITORY/releases/$release_id")
+          printf '%s' "$final_release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > promotion-stage/release-asset-snapshot-final.json
+          cmp -s promotion-stage/release-asset-snapshot.json promotion-stage/release-asset-snapshot-final.json || { echo "::error::Release assets changed during isolated download"; exit 1; }
+          if [ "$release_phase" = draft ]; then
+            printf '%s' "$final_release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag and .draft == true and .prerelease == false
+              and .name == $title and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null || { echo "::error::Draft identity changed during isolated download"; exit 1; }
+          else
+            printf '%s' "$final_release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+              and .name == $title and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null || { echo "::error::Published identity changed during isolated download"; exit 1; }
+          fi
+          artifact_name="release-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'release_id=%s\nsource_sha=%s\nverification_tooling_sha=%s\nrelease_phase=%s\nartifact_name=%s\n' \
+            "$release_id" "$source_sha" "$main_sha" "$release_phase" "$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload isolated release package
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.stage.outputs.artifact_name }}
+          path: promotion-stage
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  stage-stable:
+    name: Stage stable release for read-only repair
+    if: needs.request.outputs.mode == 'repair'
+    needs: request
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    outputs:
+      release_id: ${{ steps.stage.outputs.release_id }}
+      source_sha: ${{ steps.stage.outputs.source_sha }}
+      verification_tooling_sha: ${{ steps.stage.outputs.verification_tooling_sha }}
+      release_phase: ${{ steps.stage.outputs.release_phase }}
+      artifact_name: ${{ steps.stage.outputs.artifact_name }}
+    steps:
+      - name: Stage immutable stable release
+        id: stage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve protected main"; exit 1; }
+          [ "$main_sha" = "$RUN_SHA" ] || { echo "::error::Protected main moved ($main_sha != $RUN_SHA); rerun from the new tip"; exit 1; }
+
+          refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          source_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$source_sha" ] || source_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable source for $TAG"; exit 1; }
+          comparison=$(gh api "repos/$REPOSITORY/compare/$source_sha...$main_sha" --jq .status)
+          case "$comparison" in
+            ahead|identical) ;;
+            *) echo "::error::Release tag $TAG is not reachable from protected main ($comparison)"; exit 1 ;;
+          esac
+
+          release=$(gh api "repos/$REPOSITORY/releases/tags/$TAG")
+          release_id=$(printf '%s' "$release" | jq -r '.id // empty')
+          printf '%s' "$release_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Release returned an invalid id"; exit 1; }
+          expected_title="Chimera Switch $TAG"
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+            and .name == $title and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null || { echo "::error::$TAG must be the expected immutable bot-owned stable release for R2 repair"; exit 1; }
+
+          rm -rf promotion-stage
+          mkdir -p promotion-stage/release-assets
+          printf '%s' "$release" > promotion-stage/release.json
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > promotion-stage/release-asset-snapshot.json
+          jq -e '
+            length > 0
+            and all(.[];
+              (.id | type == "number") and .id > 0
+              and ((.name | type) == "string")
+              and (.name | test("^[A-Za-z0-9][A-Za-z0-9._+-]*$"))
+              and (.size | type == "number") and .size > 0
+              and .state == "uploaded"
+              and ((.digest | type) == "string")
+              and (.digest | test("^sha256:[0-9a-f]{64}$")))
+            and ((map(.id) | length) == (map(.id) | unique | length))
+            and ((map(.name) | length) == (map(.name) | unique | length))
+          ' promotion-stage/release-asset-snapshot.json >/dev/null || { echo "::error::Release asset metadata is unsafe or incomplete"; exit 1; }
+          expected_assets=()
+          for suffix in \
+            Linux-arm64.AppImage \
+            Linux-arm64.deb \
+            Linux-arm64.rpm \
+            Linux-x86_64.AppImage \
+            Linux-x86_64.deb \
+            Linux-x86_64.rpm \
+            macOS.dmg \
+            macOS.tar.gz \
+            macOS.zip \
+            Windows-arm64-Portable.zip \
+            Windows-arm64.msi \
+            Windows-Portable.zip \
+            Windows.msi
+          do
+            expected_assets+=("Chimera-Switch-$TAG-$suffix" "Chimera-Switch-$TAG-$suffix.sig")
+          done
+          expected_assets+=(latest.json provenance.json provenance.json.sig)
+          printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort > expected-assets.txt
+          jq -r '.[].name' promotion-stage/release-asset-snapshot.json | LC_ALL=C sort > actual-assets.txt
+          cmp -s expected-assets.txt actual-assets.txt || {
+            echo "::error::Release assets do not match the fixed 29-file publication contract"
+            diff -u expected-assets.txt actual-assets.txt || true
+            exit 1
+          }
+          rm -f expected-assets.txt actual-assets.txt
+          jq -e 'all(.[]; .size <= 268435456) and ([.[].size] | add <= 1073741824)' \
+            promotion-stage/release-asset-snapshot.json >/dev/null || {
+              echo "::error::Release assets exceed the 256 MiB per-file or 1 GiB total staging limits"
+              exit 1
+            }
+          while IFS=$'\t' read -r asset_id name; do
+            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "promotion-stage/release-assets/$name"
+            [ -s "promotion-stage/release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          (cd promotion-stage && sha256sum release-assets/* | sort -k2 > downloaded-sha256.txt)
+          jq -n --arg tag "$TAG" --argjson release_id "$release_id" --arg source_sha "$source_sha" \
+            --arg verification_tooling_sha "$main_sha" \
+            '{tag:$tag,releaseId:$release_id,sourceSha:$source_sha,verificationToolingSha:$verification_tooling_sha,releasePhase:"published"}' \
+            > promotion-stage/stage-metadata.json
+
+          final_release=$(gh api "repos/$REPOSITORY/releases/$release_id")
+          printf '%s' "$final_release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > promotion-stage/release-asset-snapshot-final.json
+          cmp -s promotion-stage/release-asset-snapshot.json promotion-stage/release-asset-snapshot-final.json || { echo "::error::Stable release assets changed during isolated download"; exit 1; }
+          printf '%s' "$final_release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+            and .name == $title and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null || { echo "::error::Stable release identity changed during isolated download"; exit 1; }
+          artifact_name="release-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'release_id=%s\nsource_sha=%s\nverification_tooling_sha=%s\nrelease_phase=published\nartifact_name=%s\n' \
+            "$release_id" "$source_sha" "$main_sha" "$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload isolated release package
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.stage.outputs.artifact_name }}
+          path: promotion-stage
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  verify-release:
+    name: Verify isolated release provenance
+    needs: [request, stage-draft, stage-stable]
+    if: >-
+      always()
+      && needs.request.result == 'success'
+      && ((needs.request.outputs.mode == 'promote' && needs.stage-draft.result == 'success')
+      || (needs.request.outputs.mode == 'repair' && needs.stage-stable.result == 'success'))
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ needs.request.outputs.tag }}
+      request_id: ${{ needs.request.outputs.request_id }}
+      mode: ${{ needs.request.outputs.mode }}
+      release_id: ${{ steps.verify.outputs.release_id }}
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      release_tooling_sha: ${{ steps.verify.outputs.release_tooling_sha }}
+      verification_tooling_sha: ${{ steps.verify.outputs.verification_tooling_sha }}
+      workflow_run_id: ${{ steps.verify.outputs.workflow_run_id }}
+      workflow_run_attempt: ${{ steps.verify.outputs.workflow_run_attempt }}
+      asset_snapshot_sha256: ${{ steps.verify.outputs.asset_snapshot_sha256 }}
+      release_phase: ${{ steps.verify.outputs.release_phase }}
+    steps:
       - name: Checkout protected verification tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ steps.resolve.outputs.verification_tooling_sha }}
+          ref: ${{ needs.stage-draft.outputs.verification_tooling_sha || needs.stage-stable.outputs.verification_tooling_sha }}
           sparse-checkout: scripts
           persist-credentials: false
 
-      - name: Download exact assets and verify signed provenance
+      - name: Download isolated release package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.stage-draft.outputs.artifact_name || needs.stage-stable.outputs.artifact_name }}
+          path: promotion-stage
+
+      - name: Verify signed provenance without write credentials
         id: verify
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
-          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
-          VERIFICATION_TOOLING_SHA: ${{ steps.resolve.outputs.verification_tooling_sha }}
-          MODE: ${{ steps.request.outputs.mode }}
+          MODE: ${{ needs.request.outputs.mode }}
+          RELEASE_ID: ${{ needs.stage-draft.outputs.release_id || needs.stage-stable.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.stage-draft.outputs.source_sha || needs.stage-stable.outputs.source_sha }}
+          VERIFICATION_TOOLING_SHA: ${{ needs.stage-draft.outputs.verification_tooling_sha || needs.stage-stable.outputs.verification_tooling_sha }}
+          RELEASE_PHASE: ${{ needs.stage-draft.outputs.release_phase || needs.stage-stable.outputs.release_phase }}
         run: |
           set -euo pipefail
-          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id"; exit 1; }
-          release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid staged release id"; exit 1; }
+          printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid staged source SHA"; exit 1; }
+          printf '%s' "$VERIFICATION_TOOLING_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid verification tooling SHA"; exit 1; }
+          case "$MODE:$RELEASE_PHASE" in
+            promote:draft|promote:published|repair:published) ;;
+            *) echo "::error::Invalid staged release mode/state: $MODE:$RELEASE_PHASE"; exit 1 ;;
+          esac
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --arg source "$SOURCE_SHA" --arg tooling "$VERIFICATION_TOOLING_SHA" --arg phase "$RELEASE_PHASE" '
+            .tag == $tag and .releaseId == $id and .sourceSha == $source
+            and .verificationToolingSha == $tooling and .releasePhase == $phase
+          ' promotion-stage/stage-metadata.json >/dev/null || { echo "::error::Isolated stage metadata does not match protected outputs"; exit 1; }
+          (cd promotion-stage && sha256sum -c downloaded-sha256.txt)
+
           expected_title="Chimera Switch $TAG"
           marker='<!-- chimera-automated-release-draft:v1 -->'
-          if [ "$MODE" = repair ]; then
-            printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
-              .id == $id and .tag_name == $tag
-              and .draft == false and .prerelease == false
-              and .immutable == true and (.published_at != null)
-            ' >/dev/null || { echo "::error::Release changed from immutable stable during verification"; exit 1; }
-          else
-            printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-              .id == $id and .tag_name == $tag
-              and .draft == true and .prerelease == false
-              and .name == $title
-              and .author.login == "github-actions[bot]"
+          if [ "$RELEASE_PHASE" = draft ]; then
+            jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag and .draft == true and .prerelease == false
+              and .name == $title and .author.login == "github-actions[bot]"
               and ((.body // "") | contains($marker))
-            ' >/dev/null || { echo "::error::Draft identity changed during verification"; exit 1; }
+            ' promotion-stage/release.json >/dev/null || { echo "::error::Staged draft identity is invalid"; exit 1; }
+          else
+            jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+              and .name == $title and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' promotion-stage/release.json >/dev/null || { echo "::error::Staged stable identity is invalid"; exit 1; }
           fi
-          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot.json
-          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG"
-          snapshot_sha=$(sha256sum release-asset-snapshot.json | awk '{print $1}')
-          rm -rf release-assets
-          mkdir -p release-assets
-          while IFS=$'\t' read -r asset_id name; do
-            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
-            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
-            [ ! -e "release-assets/$name" ] || { echo "::error::Duplicate release asset name: $name"; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "release-assets/$name"
-            [ -s "release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
-          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
-          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG" release-assets
 
-          node scripts/verify-release-assets.mjs release-assets "$TAG" "$REPOSITORY" release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
+          node scripts/validate-release-asset-snapshot.mjs promotion-stage/release-asset-snapshot.json "$TAG" promotion-stage/release-assets
+          snapshot_sha=$(sha256sum promotion-stage/release-asset-snapshot.json | awk '{print $1}')
+          node scripts/verify-release-assets.mjs promotion-stage/release-assets "$TAG" "$REPOSITORY" promotion-stage/release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
             --require-user-assets --expected-source-sha="$SOURCE_SHA"
-          release_tooling_sha=$(jq -r .toolingSha release-assets/provenance.json)
-          workflow_run_id=$(jq -r .workflowRunId release-assets/provenance.json)
-          workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' release-assets/provenance.json)
+          release_tooling_sha=$(jq -r .toolingSha promotion-stage/release-assets/provenance.json)
+          workflow_run_id=$(jq -r .workflowRunId promotion-stage/release-assets/provenance.json)
+          workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' promotion-stage/release-assets/provenance.json)
           printf '%s' "$release_tooling_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid release tooling SHA in provenance"; exit 1; }
           printf '%s' "$workflow_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run id in provenance"; exit 1; }
           printf '%s' "$workflow_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run attempt in provenance"; exit 1; }
           comparison=$(gh api "repos/$REPOSITORY/compare/$release_tooling_sha...$VERIFICATION_TOOLING_SHA" --jq .status)
           case "$comparison" in
             ahead|identical) ;;
-            *) echo "::error::Historical release tooling is not an ancestor of current protected verification tooling ($comparison)"; exit 1 ;;
+            *) echo "::error::Historical release tooling is not an ancestor of protected verification tooling ($comparison)"; exit 1 ;;
           esac
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id")
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")
           printf '%s' "$run_info" | jq -e --arg repo "$REPOSITORY" --arg sha "$release_tooling_sha" --argjson attempt "$workflow_run_attempt" '
             .path == ".github/workflows/release.yml"
             and (.event == "workflow_dispatch" or .event == "repository_dispatch")
-            and .head_branch == "main"
-            and .head_sha == $sha
-            and .repository.full_name == $repo
-            and .run_attempt == $attempt
+            and .head_branch == "main" and .head_sha == $sha
+            and .repository.full_name == $repo and .run_attempt == $attempt
             and .conclusion == "success"
           ' >/dev/null || { echo "::error::Signed provenance is not bound to a successful protected release workflow run"; exit 1; }
-
-          final_release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
-          if [ "$MODE" = repair ]; then
-            printf '%s' "$final_release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
-              .id == $id and .tag_name == $tag
-              and .draft == false and .prerelease == false
-              and .immutable == true and (.published_at != null)
-            ' >/dev/null || { echo "::error::Stable release identity changed during verification"; exit 1; }
-          else
-            printf '%s' "$final_release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-              .id == $id and .tag_name == $tag
-              and .draft == true and .prerelease == false
-              and .name == $title
-              and .author.login == "github-actions[bot]"
-              and ((.body // "") | contains($marker))
-            ' >/dev/null || { echo "::error::Draft identity changed during verification"; exit 1; }
-          fi
-          printf '%s' "$final_release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot-final.json
-          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot-final.json "$TAG"
-          cmp -s release-asset-snapshot.json release-asset-snapshot-final.json || { echo "::error::Release assets changed during verification"; exit 1; }
-          printf 'tag=%s\nrelease_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\n' \
-            "$TAG" "$release_tooling_sha" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" >> "$GITHUB_OUTPUT"
+          printf 'release_id=%s\nsource_sha=%s\nrelease_tooling_sha=%s\nverification_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\nrelease_phase=%s\n' \
+            "$RELEASE_ID" "$SOURCE_SHA" "$release_tooling_sha" "$VERIFICATION_TOOLING_SHA" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" "$RELEASE_PHASE" >> "$GITHUB_OUTPUT"
 
   promote-stable:
-    name: Publish immutable stable release
-    if: needs.resolve-release.outputs.mode == 'promote'
-    needs: resolve-release
+    name: Commit immutable stable release
+    if: needs.verify-release.outputs.mode == 'promote'
+    needs: [verify-release]
     runs-on: ubuntu-22.04
     environment: release
     permissions:
       contents: write
-      actions: read
     steps:
-      - name: Checkout protected verification tooling
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.resolve-release.outputs.verification_tooling_sha }}
-          sparse-checkout: scripts
-          persist-credentials: false
-
       - name: Require immutable releases
+        if: needs.verify-release.outputs.release_phase == 'draft'
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
@@ -257,6 +491,7 @@ jobs:
           [ "$enabled" = true ] || { echo "::error::Repository immutable releases must be enabled before stable publication"; exit 1; }
 
       - name: Validate optional mirror configuration before publication
+        if: needs.verify-release.outputs.release_phase == 'draft'
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -280,17 +515,23 @@ jobs:
               ;;
           esac
 
-      - name: Re-verify exact draft and publish once
+      - name: Commit verified release state idempotently
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.resolve-release.outputs.release_id }}
-          SOURCE_SHA: ${{ needs.resolve-release.outputs.source_sha }}
-          RELEASE_TOOLING_SHA: ${{ needs.resolve-release.outputs.release_tooling_sha }}
-          WORKFLOW_RUN_ID: ${{ needs.resolve-release.outputs.workflow_run_id }}
-          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve-release.outputs.workflow_run_attempt }}
-          SNAPSHOT_SHA256: ${{ needs.resolve-release.outputs.asset_snapshot_sha256 }}
+          RELEASE_ID: ${{ needs.verify-release.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
+          VERIFICATION_TOOLING_SHA: ${{ needs.verify-release.outputs.verification_tooling_sha }}
+          SNAPSHOT_SHA256: ${{ needs.verify-release.outputs.asset_snapshot_sha256 }}
         run: |
           set -euo pipefail
+          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id before publication"; exit 1; }
+
+          # Resolve protected main and the tag immediately before the final Release read.
+          # GitHub's Releases API rejects conditional PATCHes against its weak ETag,
+          # so the final validated GET below is deliberately the last network read.
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not re-resolve protected main"; exit 1; }
+          [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || { echo "::error::Protected main moved before publication ($main_sha != $VERIFICATION_TOOLING_SHA); rerun from the new tip"; exit 1; }
           refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
           remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
           [ -n "$remote_sha" ] || remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
@@ -299,92 +540,39 @@ jobs:
           release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
           marker='<!-- chimera-automated-release-draft:v1 -->'
           expected_title="Chimera Switch $TAG"
-          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id before publication"; exit 1; }
-          printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-            .id == $id
-            and .tag_name == $tag
-            and .draft == true
-            and .prerelease == false
-            and .name == $title
-            and .author.login == "github-actions[bot]"
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-snapshot.json
+          [ "$(sha256sum release-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Release asset identity snapshot changed before publication"; exit 1; }
+          if printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag and .draft == true and .prerelease == false
+            and .name == $title and .author.login == "github-actions[bot]"
             and ((.body // "") | contains($marker))
-          ' >/dev/null || { echo "::error::Draft state or ownership changed before publication"; exit 1; }
-          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > draft-snapshot.json
-          node scripts/validate-release-asset-snapshot.mjs draft-snapshot.json "$TAG"
-          [ "$(sha256sum draft-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Draft asset identity snapshot changed"; exit 1; }
-
-          rm -rf release-assets
-          mkdir -p release-assets
-          while IFS=$'\t' read -r asset_id name; do
-            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
-            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
-            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "release-assets/$name"
-          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
-          node scripts/validate-release-asset-snapshot.mjs draft-snapshot.json "$TAG" release-assets
-          node scripts/verify-release-assets.mjs release-assets "$TAG" "$REPOSITORY" release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
-            --require-user-assets --expected-source-sha="$SOURCE_SHA" --expected-tooling-sha="$RELEASE_TOOLING_SHA"
-          [ "$(jq -r .workflowRunId release-assets/provenance.json)" = "$WORKFLOW_RUN_ID" ] || { echo "::error::Release workflow run binding changed"; exit 1; }
-          [ "$(jq -r .workflowRunAttempt release-assets/provenance.json)" = "$WORKFLOW_RUN_ATTEMPT" ] || { echo "::error::Release workflow attempt binding changed"; exit 1; }
-
-          final_draft=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
-          printf '%s' "$final_draft" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > draft-snapshot-final.json
-          node scripts/validate-release-asset-snapshot.mjs draft-snapshot-final.json "$TAG"
-          [ "$(sha256sum draft-snapshot-final.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Draft assets changed during final verification"; exit 1; }
-          printf '%s' "$final_draft" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-            .id == $id and .tag_name == $tag
-            and .draft == true and .prerelease == false
-            and .name == $title
-            and .author.login == "github-actions[bot]"
-            and ((.body // "") | contains($marker))
-          ' >/dev/null || { echo "::error::Draft identity changed during final verification"; exit 1; }
-
-          gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
-            -F draft=false -F prerelease=false -f make_latest=true > published-release.json
-          jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-            .id == $id and .tag_name == $tag
-            and .draft == false and .prerelease == false
+          ' >/dev/null; then
+            release_phase=draft
+          elif printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag and .draft == false and .prerelease == false
             and .immutable == true and (.published_at != null)
-            and .name == $title
-            and .author.login == "github-actions[bot]"
+            and .name == $title and .author.login == "github-actions[bot]"
             and ((.body // "") | contains($marker))
-          ' published-release.json >/dev/null || {
-            echo "::error::GitHub did not return the expected immutable stable release state"; exit 1;
-          }
-          published=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
-          printf '%s' "$published" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
-            .id == $id and .tag_name == $tag
-            and .draft == false and .prerelease == false
-            and .immutable == true and (.published_at != null)
-            and .name == $title
-            and .author.login == "github-actions[bot]"
-            and ((.body // "") | contains($marker))
-          ' >/dev/null || { echo "::error::Published release is not immutable stable"; exit 1; }
-          printf '%s' "$published" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > published-snapshot.json
-          node scripts/validate-release-asset-snapshot.mjs published-snapshot.json "$TAG" release-assets
-          [ "$(sha256sum published-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Published immutable asset snapshot differs from the verified draft"; exit 1; }
+          ' >/dev/null; then
+            release_phase=published
+          else
+            echo "::error::Release state or ownership changed before publication"
+            exit 1
+          fi
 
-          # GitHub creates a release attestation when an immutable release is
-          # published. Verify both the release-wide statement and every asset.
-          for attempt in $(seq 1 10); do
-            gh release verify "$TAG" --repo "$REPOSITORY" >/dev/null && break
-            [ "$attempt" -lt 10 ] || { echo "::error::GitHub immutable release attestation verification failed"; exit 1; }
-            sleep 3
-          done
-          while IFS= read -r file; do
-            verified=false
-            for attempt in $(seq 1 10); do
-              if gh release verify-asset "$TAG" "$file" --repo "$REPOSITORY" >/dev/null; then verified=true; break; fi
-              sleep 3
-            done
-            [ "$verified" = true ] || { echo "::error::GitHub release attestation failed for $(basename "$file")"; exit 1; }
-          done < <(find release-assets -maxdepth 1 -type f -print | sort)
-          [ "$(gh api "repos/$REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG" ] || { echo "::error::$TAG was not selected as latest stable release"; exit 1; }
-          echo "Published and cryptographically verified immutable stable release $TAG."
+          # Local checks only between the final Release GET and the sole write.
+          if [ "$release_phase" = draft ]; then
+            gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
+              -F draft=false -F prerelease=false -f make_latest=true >/dev/null
+            echo "Committed stable publication for $TAG. Read-only post-publication verification will run next."
+          else
+            echo "::notice::$TAG is already the exact verified immutable release; continuing the idempotent retry"
+          fi
 
   authorize-repair:
     name: Authorize read-only R2 repair
-    if: needs.resolve-release.outputs.mode == 'repair'
-    needs: resolve-release
+    if: needs.verify-release.outputs.mode == 'repair'
+    needs: [verify-release]
     runs-on: ubuntu-22.04
     environment: release
     permissions:
@@ -393,8 +581,8 @@ jobs:
       - name: Confirm stable release snapshot without mutation
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.resolve-release.outputs.release_id }}
-          SNAPSHOT_SHA256: ${{ needs.resolve-release.outputs.asset_snapshot_sha256 }}
+          RELEASE_ID: ${{ needs.verify-release.outputs.release_id }}
+          SNAPSHOT_SHA256: ${{ needs.verify-release.outputs.asset_snapshot_sha256 }}
         run: |
           set -euo pipefail
           release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
@@ -402,31 +590,124 @@ jobs:
             echo "::error::R2 repair target is no longer a stable release"; exit 1;
           }
           printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > stable-snapshot.json
-          node scripts/validate-release-asset-snapshot.mjs stable-snapshot.json "$TAG"
           [ "$(sha256sum stable-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Stable asset snapshot changed"; exit 1; }
           echo "Authorized R2 repair with read-only GitHub Release permissions."
 
-  sync-r2:
-    name: Sync stable release to R2
-    needs: [resolve-release, promote-stable, authorize-repair]
+  verify-published:
+    name: Verify immutable public release
+    needs: [verify-release, promote-stable, authorize-repair]
     if: >-
       always()
-      && needs.resolve-release.result == 'success'
-      && ((needs.resolve-release.outputs.mode == 'repair'
-      && needs.authorize-repair.result == 'success')
-      || (needs.resolve-release.outputs.mode == 'promote'
-      && needs.promote-stable.result == 'success'))
+      && needs.verify-release.result == 'success'
+      && ((needs.verify-release.outputs.mode == 'promote' && needs.promote-stable.result == 'success')
+      || (needs.verify-release.outputs.mode == 'repair' && needs.authorize-repair.result == 'success'))
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout protected verification tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.verify-release.outputs.verification_tooling_sha }}
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Re-download and verify immutable public release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ needs.verify-release.outputs.mode }}
+          RELEASE_ID: ${{ needs.verify-release.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
+          RELEASE_TOOLING_SHA: ${{ needs.verify-release.outputs.release_tooling_sha }}
+          VERIFICATION_TOOLING_SHA: ${{ needs.verify-release.outputs.verification_tooling_sha }}
+          WORKFLOW_RUN_ID: ${{ needs.verify-release.outputs.workflow_run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.verify-release.outputs.workflow_run_attempt }}
+          SNAPSHOT_SHA256: ${{ needs.verify-release.outputs.asset_snapshot_sha256 }}
+        run: |
+          set -euo pipefail
+          expected_title="Chimera Switch $TAG"
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          verified_state=false
+          for attempt in $(seq 1 10); do
+            release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID") || true
+            if printf '%s' "${release:-null}" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag
+              and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+              and .name == $title and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null 2>&1; then
+              verified_state=true
+              break
+            fi
+            sleep 3
+          done
+          [ "$verified_state" = true ] || { echo "::error::Release did not reach the expected immutable stable state"; exit 1; }
+
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || { echo "::error::Protected main changed after publication; rerun verification from the new tip"; exit 1; }
+          refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$remote_sha" ] || remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_sha" = "$SOURCE_SHA" ] || { echo "::error::Tag changed after publication"; exit 1; }
+
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > published-snapshot.json
+          node scripts/validate-release-asset-snapshot.mjs published-snapshot.json "$TAG"
+          [ "$(sha256sum published-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Published immutable asset snapshot differs from the verified candidate"; exit 1; }
+
+          rm -rf release-assets
+          mkdir -p release-assets
+          while IFS=$'\t' read -r asset_id name; do
+            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
+            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "release-assets/$name"
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          node scripts/validate-release-asset-snapshot.mjs published-snapshot.json "$TAG" release-assets
+          node scripts/verify-release-assets.mjs release-assets "$TAG" "$REPOSITORY" release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
+            --require-user-assets --expected-source-sha="$SOURCE_SHA" --expected-tooling-sha="$RELEASE_TOOLING_SHA"
+          [ "$(jq -r .workflowRunId release-assets/provenance.json)" = "$WORKFLOW_RUN_ID" ] || { echo "::error::Release workflow run binding changed"; exit 1; }
+          [ "$(jq -r .workflowRunAttempt release-assets/provenance.json)" = "$WORKFLOW_RUN_ATTEMPT" ] || { echo "::error::Release workflow attempt binding changed"; exit 1; }
+
+          for attempt in $(seq 1 10); do
+            gh release verify "$TAG" --repo "$REPOSITORY" >/dev/null && break
+            [ "$attempt" -lt 10 ] || { echo "::error::GitHub immutable release attestation verification failed"; exit 1; }
+            sleep 3
+          done
+          while IFS= read -r file; do
+            attested=false
+            for attempt in $(seq 1 10); do
+              if gh release verify-asset "$TAG" "$file" --repo "$REPOSITORY" >/dev/null; then attested=true; break; fi
+              sleep 3
+            done
+            [ "$attested" = true ] || { echo "::error::GitHub release attestation failed for $(basename "$file")"; exit 1; }
+          done < <(find release-assets -maxdepth 1 -type f -print | sort)
+          if [ "$MODE" = promote ]; then
+            is_latest=false
+            for attempt in $(seq 1 10); do
+              if [ "$(gh api "repos/$REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)" = "$TAG" ]; then is_latest=true; break; fi
+              sleep 3
+            done
+            [ "$is_latest" = true ] || { echo "::error::$TAG was not selected as latest stable release"; exit 1; }
+          fi
+          echo "Cryptographically verified immutable public release $TAG."
+
+  sync-r2:
+    name: Sync stable release to R2
+    needs: [verify-release, promote-stable, authorize-repair, verify-published]
+    if: >-
+      always()
+      && needs.verify-published.result == 'success'
     permissions:
       contents: read
       actions: read
     uses: ./.github/workflows/sync-r2.yml
     with:
-      tag: ${{ needs.resolve-release.outputs.tag }}
-      request_id: ${{ needs.resolve-release.outputs.request_id }}
-      source_sha: ${{ needs.resolve-release.outputs.source_sha }}
-      release_tooling_sha: ${{ needs.resolve-release.outputs.release_tooling_sha }}
-      verification_tooling_sha: ${{ needs.resolve-release.outputs.verification_tooling_sha }}
-      require_r2: ${{ needs.resolve-release.outputs.mode == 'repair' }}
+      tag: ${{ needs.verify-release.outputs.tag }}
+      request_id: ${{ needs.verify-release.outputs.request_id }}
+      source_sha: ${{ needs.verify-release.outputs.source_sha }}
+      release_tooling_sha: ${{ needs.verify-release.outputs.release_tooling_sha }}
+      verification_tooling_sha: ${{ needs.verify-release.outputs.verification_tooling_sha }}
+      require_r2: ${{ needs.verify-release.outputs.mode == 'repair' }}
     secrets:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
