@@ -11,6 +11,18 @@ const expectedR2Permissions = Object.freeze({
   contents: "read",
 });
 
+const expectedPromotionPermissions = Object.freeze({
+  "resolve-release": Object.freeze({ actions: "read", contents: "write" }),
+  "promote-stable": Object.freeze({ actions: "read", contents: "write" }),
+  "authorize-repair": Object.freeze({ contents: "read" }),
+});
+
+const forbiddenResolverCommands = [
+  /\bgh\s+api\b[^\n]*(?:--method|-X)\s+(?:POST|PUT|PATCH|DELETE)\b/i,
+  /\bgh\s+release\s+(?:create|delete|edit|upload)\b/i,
+  /\bgit\s+push\b/i,
+];
+
 function parseWorkflow(name) {
   const workflow = parse(readWorkflow(name));
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
@@ -27,6 +39,15 @@ function normalizePermissions(value, label) {
   return Object.fromEntries(
     Object.entries(value).sort(([left], [right]) => left.localeCompare(right)),
   );
+}
+
+function expectExactPermissions(actual, expected, label) {
+  if (
+    JSON.stringify(normalizePermissions(actual, label)) !==
+    JSON.stringify(normalizePermissions(expected, `expected ${label}`))
+  ) {
+    throw new Error(`${label} must declare exactly the approved permissions`);
+  }
 }
 
 function validateReusablePermissionContract(caller, callee) {
@@ -66,12 +87,149 @@ function validateReusablePermissionContract(caller, callee) {
   }
 }
 
+function validatePromotionPermissionContract(workflow) {
+  expectExactPermissions(
+    workflow.permissions,
+    { contents: "read" },
+    "promote-release workflow",
+  );
+
+  for (const [jobName, expected] of Object.entries(
+    expectedPromotionPermissions,
+  )) {
+    expectExactPermissions(
+      workflow.jobs?.[jobName]?.permissions,
+      expected,
+      `${jobName} job`,
+    );
+  }
+
+  const approvedWriters = new Set(["resolve-release", "promote-stable"]);
+  for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+    if (
+      job?.permissions?.contents === "write" &&
+      !approvedWriters.has(jobName)
+    ) {
+      throw new Error(`unexpected contents writer: ${jobName}`);
+    }
+  }
+
+  const resolver = workflow.jobs?.["resolve-release"];
+  if (!Array.isArray(resolver?.steps)) {
+    throw new TypeError("resolve-release must define explicit steps");
+  }
+  if (resolver.environment !== "release") {
+    throw new Error(
+      "resolve-release must use the protected release environment",
+    );
+  }
+
+  const checkout = resolver.steps.find(
+    (step) =>
+      typeof step.uses === "string" &&
+      step.uses.startsWith("actions/checkout@"),
+  );
+  if (checkout?.with?.["persist-credentials"] !== false) {
+    throw new Error(
+      "resolve-release checkout must not persist write credentials",
+    );
+  }
+
+  const resolverCommands = resolver.steps
+    .map((step) => (typeof step.run === "string" ? step.run : ""))
+    .join("\n");
+  for (const pattern of forbiddenResolverCommands) {
+    if (pattern.test(resolverCommands)) {
+      throw new Error("resolve-release must remain non-mutating");
+    }
+  }
+}
+
 function loadProductionWorkflows() {
   return {
     caller: parseWorkflow("promote-release.yml"),
     callee: parseWorkflow("sync-r2.yml"),
   };
 }
+
+describe("release promotion permissions", () => {
+  it("confines draft visibility and publication write access to approved jobs", () => {
+    const { caller } = loadProductionWorkflows();
+
+    expect(() => validatePromotionPermissionContract(caller)).not.toThrow();
+  });
+
+  it("rejects read-only draft resolution because GitHub hides draft releases", () => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["resolve-release"].permissions.contents = "read";
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "resolve-release job must declare exactly the approved permissions",
+    );
+  });
+
+  it("rejects unnecessary permissions on the draft resolver", () => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["resolve-release"].permissions.issues = "read";
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "resolve-release job must declare exactly the approved permissions",
+    );
+  });
+
+  it("keeps the R2 repair authorization job read-only", () => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["authorize-repair"].permissions.contents = "write";
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "authorize-repair job must declare exactly the approved permissions",
+    );
+  });
+
+  it("rejects write access on a future unapproved job", () => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["future-job"] = { permissions: { contents: "write" } };
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "unexpected contents writer: future-job",
+    );
+  });
+
+  it("requires environment protection for draft visibility access", () => {
+    const { caller } = loadProductionWorkflows();
+    delete caller.jobs["resolve-release"].environment;
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "resolve-release must use the protected release environment",
+    );
+  });
+
+  it.each([
+    'gh api --method PATCH "repos/example/releases/1" -F draft=false',
+    'gh api -X DELETE "repos/example/releases/1"',
+    "gh release edit v1.2.3 --draft=false",
+    "git push origin main",
+  ])("rejects a mutating resolver command: %s", (command) => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["resolve-release"].steps.push({ run: command });
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "resolve-release must remain non-mutating",
+    );
+  });
+
+  it("rejects persisted write credentials in the resolver checkout", () => {
+    const { caller } = loadProductionWorkflows();
+    const checkout = caller.jobs["resolve-release"].steps.find((step) =>
+      step.uses?.startsWith("actions/checkout@"),
+    );
+    checkout.with["persist-credentials"] = true;
+
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "resolve-release checkout must not persist write credentials",
+    );
+  });
+});
 
 describe("reusable release workflow permissions", () => {
   it("grants exactly the required read permissions to caller and callee", () => {

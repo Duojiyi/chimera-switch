@@ -39,8 +39,12 @@ jobs:
   resolve-release:
     name: Resolve and verify release provenance
     runs-on: ubuntu-22.04
+    environment: release
+    # GitHub only exposes draft Releases to tokens with push access. Keep this
+    # exceptional write capability confined to the non-mutating resolver; the
+    # environment-protected promote-stable job remains the only publisher.
     permissions:
-      contents: read
+      contents: write
       actions: read
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
