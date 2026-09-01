@@ -784,12 +784,12 @@ requires_openai_auth = true
         .expect("switch to third-party provider should succeed");
 
     assert!(
-        !cc_switch_lib::get_codex_auth_path().exists(),
+        !chimera_switch_lib::get_codex_auth_path().exists(),
         "default (preservation off) must delete auth.json on a third-party switch — \
          the official login goes away and the key rides in config.toml instead"
     );
-    let live_config =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         live_config.contains("experimental_bearer_token = \"third-party-key\""),
         "the third-party key must be injected as the provider-scoped bearer token; got:\n{live_config}"
@@ -841,12 +841,12 @@ requires_openai_auth = false
         .expect("switch to third-party provider should succeed");
 
     assert!(
-        !cc_switch_lib::get_codex_auth_path().exists(),
+        !chimera_switch_lib::get_codex_auth_path().exists(),
         "third-party switches are config-only: no auth.json is written"
     );
 
-    let live_config =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         live_config.contains("experimental_bearer_token = \"third-party-key\""),
         "default switch must inject the API key into config.toml so Codex >= 0.149 \
@@ -950,8 +950,8 @@ openai_base_url = "https://relay.example/v1"
     ProviderService::switch(&state, AppType::Codex, "legacy-shape")
         .expect("legacy reroute shape must be normalized, not rejected");
 
-    let live_config =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         !live_config.contains("openai_base_url"),
         "the top-level reroute must be rewritten away; got:\n{live_config}"
@@ -1015,8 +1015,8 @@ experimental_bearer_token = "config-carried-key"
     ProviderService::switch(&state, AppType::Codex, "raw-edited")
         .expect("legacy reroute with a config-carried token must be normalized");
 
-    let live_config =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         !live_config.contains("openai_base_url"),
         "the top-level reroute must be rewritten away; got:\n{live_config}"
@@ -1026,7 +1026,7 @@ experimental_bearer_token = "config-carried-key"
         "a cc-switch provider table must be created; got:\n{live_config}"
     );
     assert_eq!(
-        cc_switch_lib::extract_codex_experimental_bearer_token(&live_config).as_deref(),
+        chimera_switch_lib::extract_codex_experimental_bearer_token(&live_config).as_deref(),
         Some("config-carried-key"),
         "the config-carried key must resolve for the rewritten provider; got:\n{live_config}"
     );
@@ -1072,11 +1072,11 @@ openai_base_url = "https://relay.example/v1"
         .expect("default-path switch must normalize the legacy ambient-auth shape");
 
     assert!(
-        !cc_switch_lib::get_codex_auth_path().exists(),
+        !chimera_switch_lib::get_codex_auth_path().exists(),
         "third-party switches are config-only: no auth.json is written"
     );
-    let live_config =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         !live_config.contains("openai_base_url")
             && live_config.contains("[model_providers.cc-switch]")
@@ -1217,8 +1217,8 @@ http_headers = { Authorization = "Bearer explicit-header-token" }
     ProviderService::switch(&state, AppType::Codex, "header-auth")
         .expect("preservation-on switch must keep supporting keyless header-auth providers");
 
-    let config_text =
-        std::fs::read_to_string(cc_switch_lib::get_codex_config_path()).expect("read config.toml");
+    let config_text = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
+        .expect("read config.toml");
     assert!(
         config_text.contains("Authorization = \"Bearer explicit-header-token\""),
         "the provider's own Authorization header must be written verbatim; got:\n{config_text}"
