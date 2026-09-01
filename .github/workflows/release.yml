@@ -901,7 +901,11 @@ jobs:
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is not a Tauri rsign private-key envelope"
             exit 1
           fi
-          printf '%s\n' "$ONE" > "$KEY_PATH"
+          # The Tauri CLI decodes this file as strict base64; a trailing LF is
+          # an invalid base64 symbol for the current CLI. Keep the canonical
+          # secret byte-for-byte when materializing it on disk.
+          printf '%s' "$ONE" > "$KEY_PATH"
+          [ "$(wc -c < "$KEY_PATH")" -eq "${#ONE}" ] || { echo "::error::Materialized Tauri key changed bytes"; exit 1; }
           chmod 600 "$KEY_PATH"
           mapfile -t signable < <(find release-assets -mindepth 1 -maxdepth 1 -type f ! -name '*.sig' ! -name 'provenance.json' ! -name 'latest.json' -printf '%f\n' | sort)
           [ "${#signable[@]}" -eq 13 ] || { echo "::error::Expected exactly 13 complete release artifacts before signing, found ${#signable[@]}"; exit 1; }
