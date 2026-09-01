@@ -11,7 +11,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { getReleaseAssetContract, releaseTagPattern } from "./release-asset-contract.mjs";
+import {
+  getReleaseAssetContract,
+  gitCommitShaPattern,
+  releaseTagPattern,
+  sha256DigestPattern,
+} from "./release-asset-contract.mjs";
 
 const args = process.argv.slice(2);
 const [assetsDir, tag, repo, latestJsonArg, publicKeyBase64] = args;
@@ -22,18 +27,17 @@ const requireUserAssets = args.includes("--require-user-assets");
 const expectedSourceSha = args.find((arg) => arg.startsWith("--expected-source-sha="))?.split("=", 2)[1];
 const expectedToolingSha = args.find((arg) => arg.startsWith("--expected-tooling-sha="))?.split("=", 2)[1];
 const tagPattern = releaseTagPattern;
-const shaPattern = /^[0-9a-f]{40}$/;
 const githubRepoPattern = /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$/;
 
 if (!assetsDir || !tagPattern.test(tag ?? "") || !githubRepoPattern.test(repo ?? "")) {
   console.error("Usage: node scripts/verify-release-assets.mjs <assets-dir> <vX.Y.Z> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned] [--legacy] [--require-user-assets] [--expected-source-sha=<sha>] [--expected-tooling-sha=<sha>]");
   process.exit(1);
 }
-if (expectedSourceSha && !shaPattern.test(expectedSourceSha)) {
+if (expectedSourceSha && !gitCommitShaPattern.test(expectedSourceSha)) {
   console.error(`Invalid expected source SHA: ${expectedSourceSha}`);
   process.exit(1);
 }
-if (expectedToolingSha && !shaPattern.test(expectedToolingSha)) {
+if (expectedToolingSha && !gitCommitShaPattern.test(expectedToolingSha)) {
   console.error(`Invalid expected tooling SHA: ${expectedToolingSha}`);
   process.exit(1);
 }
@@ -47,6 +51,7 @@ const {
   mandatoryUserAssets,
   signableAssets,
   expectedSignatures,
+  provenanceAssetNames,
   provenanceName,
   provenanceSignatureName,
   latestAssetName,
@@ -270,8 +275,8 @@ if (!unsignedMode) {
     if (provenance.schemaVersion !== 1) failures.push(`${provenanceName}: unsupported schemaVersion`);
     if (provenance.repository !== repo) failures.push(`${provenanceName}: repository is not ${repo}`);
     if (provenance.tag !== tag) failures.push(`${provenanceName}: tag is not ${tag}`);
-    if (!shaPattern.test(provenance.sourceSha ?? "")) failures.push(`${provenanceName}: sourceSha is not an immutable commit SHA`);
-    if (!shaPattern.test(provenance.toolingSha ?? "")) failures.push(`${provenanceName}: toolingSha is not an immutable commit SHA`);
+    if (!gitCommitShaPattern.test(provenance.sourceSha ?? "")) failures.push(`${provenanceName}: sourceSha is not an immutable commit SHA`);
+    if (!gitCommitShaPattern.test(provenance.toolingSha ?? "")) failures.push(`${provenanceName}: toolingSha is not an immutable commit SHA`);
     if (!Number.isSafeInteger(provenance.workflowRunId) || provenance.workflowRunId <= 0) failures.push(`${provenanceName}: workflowRunId is invalid`);
     if (provenance.workflowRunAttempt !== undefined && (!Number.isSafeInteger(provenance.workflowRunAttempt) || provenance.workflowRunAttempt <= 0)) failures.push(`${provenanceName}: workflowRunAttempt is invalid`);
     if (expectedSourceSha && provenance.sourceSha !== expectedSourceSha) failures.push(`${provenanceName}: sourceSha does not match the validated release tag`);
@@ -281,8 +286,8 @@ if (!unsignedMode) {
     // timestamp after signing. It is verified independently below, so it remains
     // intentionally outside the signer provenance checksum set.
     const actualChecksums = {};
-    for (const name of assetsOnDisk) {
-      if (name !== provenanceName && name !== provenanceSignatureName && name !== latestAssetName) {
+    for (const name of provenanceAssetNames) {
+      if (assetsOnDisk.includes(name)) {
         actualChecksums[name] = sha256(fs.readFileSync(path.join(assetsDir, name)));
       }
     }
@@ -296,7 +301,7 @@ if (!unsignedMode) {
         failures.push(`${provenanceName}: asset checksum map does not match the downloaded signed asset set`);
       }
       for (const name of expectedNames) {
-        if (!shaPattern.test(expectedChecksums[name] ?? "") || expectedChecksums[name] !== actualChecksums[name]) {
+        if (!sha256DigestPattern.test(expectedChecksums[name] ?? "") || expectedChecksums[name] !== actualChecksums[name]) {
           failures.push(`${provenanceName}: checksum mismatch for ${name}`);
         }
       }
