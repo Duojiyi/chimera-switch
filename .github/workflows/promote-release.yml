@@ -256,25 +256,29 @@ jobs:
           }
           [ "$enabled" = true ] || { echo "::error::Repository immutable releases must be enabled before stable publication"; exit 1; }
 
-      - name: Require mirror credentials
+      - name: Validate optional mirror configuration before publication
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ] || {
-            echo "::error::R2 credentials must be configured before stable publication"
-            exit 1
-          }
-          R2_ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
-          aws s3api head-bucket --bucket chimera-switch-releases --endpoint-url "$R2_ENDPOINT" >/dev/null || {
-            echo "::error::R2 credentials cannot access the release bucket; refusing irreversible publication"
-            exit 1
-          }
+          configured=0
+          [ -n "$R2_ACCOUNT_ID" ] && configured=$((configured + 1))
+          [ -n "$R2_ACCESS_KEY_ID" ] && configured=$((configured + 1))
+          [ -n "$R2_SECRET_ACCESS_KEY" ] && configured=$((configured + 1))
+          case "$configured" in
+            0)
+              echo '::notice::R2 is not configured; GitHub will remain the authoritative release source and mirror synchronization will be skipped'
+              ;;
+            3)
+              echo 'A complete R2 credential set is configured; mirror synchronization will be attempted after publication.'
+              ;;
+            *)
+              echo '::error::R2 credentials are partially configured; refusing irreversible publication until all three values are configured or removed'
+              exit 1
+              ;;
+          esac
 
       - name: Re-verify exact draft and publish once
         env:
@@ -419,6 +423,7 @@ jobs:
       source_sha: ${{ needs.resolve-release.outputs.source_sha }}
       release_tooling_sha: ${{ needs.resolve-release.outputs.release_tooling_sha }}
       verification_tooling_sha: ${{ needs.resolve-release.outputs.verification_tooling_sha }}
+      require_r2: ${{ needs.resolve-release.outputs.mode == 'repair' }}
     secrets:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

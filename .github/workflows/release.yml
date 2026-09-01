@@ -878,8 +878,7 @@ jobs:
             exit 1
           fi
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not configured"
-            exit 1
+            echo "::notice::No Tauri signing password is configured; attempting the existing key with an empty passphrase and requiring public-key verification"
           fi
           KEY_PATH="$RUNNER_TEMP/tauri-signing.key"
           trap 'shred -u "$KEY_PATH" 2>/dev/null || rm -f "$KEY_PATH"' EXIT
