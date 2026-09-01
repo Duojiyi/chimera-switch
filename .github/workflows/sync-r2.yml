@@ -1,277 +1,417 @@
-# Mirror release assets to Cloudflare R2 so chimerahub.org/download can serve
-# them directly (dl.chimerahub.org), and mirror the Tauri updater manifest and
-# artifacts so in-app updates avoid GitHub too (the updater verifies minisign
-# signatures client-side, so the mirror is untrusted).
-#
-# Triggered on release promotion (`released` fires when a prerelease is
-# flipped to a full release, or a release is published as stable directly) —
-# NOT on tag push. This keeps the R2 root manifests behind the same gate as
-# GitHub's /releases/latest/: while a release sits as prerelease, neither the
-# download page nor the updater sees it. Additionally, a run only touches the
-# root manifests (and prunes old versions) when its tag IS releases/latest —
-# manual backfills of older tags restore versioned files only.
-#
-# Caveat (by design of tauri-plugin-updater): the updater stops at the first
-# endpoint whose response parses, so a stale-but-valid R2 manifest would mask
-# newer GitHub releases. R2 is an optional mirror: missing credentials produce
-# a visible warning but never block the GitHub release. Configure the secrets
-# before promoting releases when the public mirror is enabled.
-#
-# Optional secrets: R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+# Mirror immutable stable release assets to Cloudflare R2. The public mirror is
+# untrusted by design: updater payloads remain protected by Minisign signatures.
+# This workflow is reusable-only so provenance values cannot be supplied through
+# an independent workflow_dispatch surface.
 name: Sync release to R2
 
+run-name: Sync R2 ${{ inputs.tag }} / request=${{ inputs.request_id }}
+
 on:
-  release:
-    types: [released]
-  # Manual recovery/backfill: re-sync any existing release tag.
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: 'Release tag to sync (e.g. v3.18.0)'
+        description: 'Stable release tag to sync (e.g. v3.20.1)'
         required: true
         type: string
+      request_id:
+        description: 'Exact caller correlation id'
+        required: true
+        type: string
+      source_sha:
+        description: 'Immutable source commit resolved from the release tag'
+        required: true
+        type: string
+      release_tooling_sha:
+        description: 'Historical protected-main commit recorded by signed release provenance'
+        required: true
+        type: string
+      verification_tooling_sha:
+        description: 'Current protected-main commit whose verification scripts are executed'
+        required: true
+        type: string
+    secrets:
+      R2_ACCOUNT_ID:
+        description: 'Cloudflare account that owns the release bucket'
+        required: true
+      R2_ACCESS_KEY_ID:
+        description: 'R2 S3-compatible access key id'
+        required: true
+      R2_SECRET_ACCESS_KEY:
+        description: 'R2 S3-compatible secret access key'
+        required: true
 
 permissions:
   contents: read
+  actions: read
 
-# latest.json / manifest.json are last-writer-wins — serialize runs.
-# GitHub Actions keeps one running and one pending run per group; additional
-# triggers are coalesced, so each run must be idempotent and re-check latest.
 concurrency:
-  group: sync-r2
+  group: r2-release-sync
   cancel-in-progress: false
+
+env:
+  R2_BUCKET: chimera-switch-releases
+  R2_PUBLIC_BASE_URL: https://dl.chimerahub.org
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+  TAG: ${{ inputs.tag }}
+  REQUEST_ID: ${{ inputs.request_id }}
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  RELEASE_TOOLING_SHA: ${{ inputs.release_tooling_sha }}
+  VERIFICATION_TOOLING_SHA: ${{ inputs.verification_tooling_sha }}
+  UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
 
 jobs:
   sync-to-r2:
-    # Stable releases only. A prerelease must never move the public mirror.
-    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
-    name: Sync release to R2
+    name: Verify and mirror immutable release
     runs-on: ubuntu-22.04
-    env:
-      R2_BUCKET: chimera-switch-releases
-      R2_PUBLIC_BASE_URL: https://dl.chimerahub.org
-      KEEP_VERSIONS: "5"
-      AWS_DEFAULT_REGION: auto
-      # aws-cli >= 2.23 defaults to CRC checksums that R2 rejects.
-      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
-      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    environment: release
     steps:
-      - name: Validate release tag
-        run: |
-          set -euo pipefail
-          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Release tag must match vX.Y.Z (received: ${TAG:-empty})"
-            exit 1
-          fi
-
-      - name: Validate stable release
+      - name: Validate caller and immutable release contract
+        id: contract
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease 2>/dev/null || true)
-          if [ -z "$release" ] || [ "$(printf '%s' "$release" | jq -r '.isDraft')" != false ] || [ "$(printf '%s' "$release" | jq -r '.isPrerelease')" != false ]; then
-            echo "::error::$TAG is not a published stable GitHub Release; refusing R2 sync."
-            exit 1
-          fi
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::R2 synchronization must run from protected main"; exit 1; }
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Tag must match vX.Y.Z"; exit 1; }
+          printf '%s' "$REQUEST_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || { echo "::error::Invalid request_id"; exit 1; }
+          for value in "$SOURCE_SHA" "$RELEASE_TOOLING_SHA" "$VERIFICATION_TOOLING_SHA"; do
+            printf '%s' "$value" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::All provenance SHAs must be immutable 40-character commits"; exit 1; }
+          done
 
-      - name: Check R2 secrets
-        id: r2
+          main_sha=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          [ "$main_sha" = "$RUN_SHA" ] && [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || {
+            echo "::error::Current protected main is not the caller-bound verification tooling SHA"
+            exit 1
+          }
+          refs=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_source=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$remote_source" ] || remote_source=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_source" = "$SOURCE_SHA" ] || { echo "::error::Tag $TAG does not resolve to caller-bound source $SOURCE_SHA"; exit 1; }
+          comparison=$(gh api "repos/$GITHUB_REPOSITORY/compare/$RELEASE_TOOLING_SHA...$VERIFICATION_TOOLING_SHA" --jq .status)
+          case "$comparison" in
+            ahead|identical) ;;
+            *) echo "::error::Historical release tooling is not an ancestor of current protected main ($comparison)"; exit 1 ;;
+          esac
+
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          release_id=$(printf '%s' "$release" | jq -r '.id // empty')
+          printf '%s' "$release_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Release returned an invalid id"; exit 1; }
+          printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+          ' >/dev/null || {
+            echo "::error::$TAG is not the expected immutable stable release bound to the verified tag"; exit 1;
+          }
+          printf 'release_id=%s\npublished_at=%s\n' "$release_id" "$(printf '%s' "$release" | jq -r .published_at)" >> "$GITHUB_OUTPUT"
+
+      - name: Require complete R2 credentials
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "$TAG" ]; then
-            echo "::error::No release tag to sync."
+          [ -n "$R2_ACCOUNT_ID" ] && [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] || {
+            echo "::error::R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY must all be configured"
             exit 1
-          fi
-          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
-            echo "::warning::R2 secrets are not fully configured; skipping the optional R2 mirror."
-            echo "Configure R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY to enable it."
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "configured=true" >> "$GITHUB_OUTPUT"
+          }
 
-      # Only the tag that IS GitHub's releases/latest may touch the bucket-root
-      # manifests or prune old versions. This keeps manual backfills of old
-      # tags harmless (they only restore versioned files — otherwise the root
-      # manifests would point at a version the prune step deletes right after)
-      # and makes out-of-order runs self-correcting: whichever run executes,
-      # only the true latest publishes the manifests.
-      - name: Check whether tag is the latest stable release
-        id: latest
-        if: steps.r2.outputs.configured == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # An API failure must fail the run — mapping it to "not latest"
-          # would skip the root manifests on a green run, silently leaving
-          # them stale (the exact failure mode this workflow exists to make
-          # loud). Retry transient errors, then give up loudly.
-          latest=""
-          for attempt in 1 2 3 4; do
-            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name || true)
-            if [ -n "$latest" ]; then
-              break
-            fi
-            if [ "$attempt" -lt 4 ]; then
-              sleep $((attempt * 10))
-            fi
-          done
-          if [ -z "$latest" ]; then
-            echo "::error::Could not resolve the latest stable release from GitHub after 4 attempts; failing instead of guessing."
-            exit 1
-          fi
-          if [ "$TAG" = "$latest" ]; then
-            echo "is_latest=true" >> "$GITHUB_OUTPUT"
-            echo "$TAG is the latest stable release; full sync."
-          else
-            echo "is_latest=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::$TAG is not the latest stable release ($latest); syncing versioned files only — root manifests and pruning are skipped."
-          fi
-
-      - name: Checkout trusted mirror scripts
-        if: steps.r2.outputs.configured == 'true'
+      - name: Checkout current protected verification tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          # Release assets are data; do not execute scripts from the release tag.
-          # Use the default branch's reviewed tooling for all mirror generation.
-          ref: main
+          ref: ${{ inputs.verification_tooling_sha }}
           path: .release-scripts
           sparse-checkout: scripts
           persist-credentials: false
 
-      - name: Setup Node.js
-        if: steps.r2.outputs.configured == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: '20'
-
-      - name: Download release assets
-        if: steps.r2.outputs.configured == 'true'
+      - name: Download exact stable assets and verify historical provenance
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.contract.outputs.release_id }}
         run: |
           set -euo pipefail
+          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id"; exit 1; }
+          release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+          ' >/dev/null || { echo "::error::Release left immutable stable state"; exit 1; }
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot.json
+          node .release-scripts/scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG"
+          rm -rf r2-assets
           mkdir -p r2-assets
-          gh release download "$TAG" --dir r2-assets --repo "$GITHUB_REPOSITORY"
-          ls -la r2-assets
-          node .release-scripts/scripts/verify-release-assets.mjs r2-assets "$TAG" "$GITHUB_REPOSITORY" r2-assets/latest.json "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
+          while IFS=$'\t' read -r asset_id name; do
+            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
+            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
+            [ ! -e "r2-assets/$name" ] || { echo "::error::Duplicate release asset name: $name"; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "r2-assets/$name"
+            [ -s "r2-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          node .release-scripts/scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG" r2-assets
 
-      - name: Generate download manifest
-        if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
+          node .release-scripts/scripts/verify-release-assets.mjs r2-assets "$TAG" "$GITHUB_REPOSITORY" r2-assets/latest.json "$UPDATER_PUBLIC_KEY" \
+            --require-user-assets --expected-source-sha="$SOURCE_SHA" --expected-tooling-sha="$RELEASE_TOOLING_SHA"
+          workflow_run_id=$(jq -r .workflowRunId r2-assets/provenance.json)
+          workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' r2-assets/provenance.json)
+          printf '%s' "$workflow_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run id"; exit 1; }
+          printf '%s' "$workflow_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run attempt"; exit 1; }
+          run_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
+          printf '%s' "$run_info" | jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$RELEASE_TOOLING_SHA" --argjson attempt "$workflow_run_attempt" '
+            .path == ".github/workflows/release.yml"
+            and (.event == "workflow_dispatch" or .event == "repository_dispatch")
+            and .head_branch == "main"
+            and .head_sha == $sha
+            and .repository.full_name == $repo
+            and .run_attempt == $attempt
+            and .conclusion == "success"
+          ' >/dev/null || { echo "::error::Release provenance is not bound to a successful protected release run"; exit 1; }
+
+          # The immutable GitHub Release attestation is an independent integrity
+          # layer over the release-wide snapshot and every downloaded asset.
+          gh release verify "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null || {
+            echo "::error::GitHub immutable release attestation verification failed"; exit 1;
+          }
+          while IFS= read -r file; do
+            gh release verify-asset "$TAG" "$file" --repo "$GITHUB_REPOSITORY" >/dev/null || {
+              echo "::error::GitHub release attestation failed for $(basename "$file")"; exit 1;
+            }
+          done < <(find r2-assets -maxdepth 1 -type f -print | sort)
+
+          final_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$final_release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+          ' >/dev/null || { echo "::error::Release state changed during mirror verification"; exit 1; }
+          printf '%s' "$final_release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot-final.json
+          node .release-scripts/scripts/validate-release-asset-snapshot.mjs release-asset-snapshot-final.json "$TAG"
+          cmp -s release-asset-snapshot.json release-asset-snapshot-final.json || { echo "::error::Immutable release asset snapshot changed"; exit 1; }
+
+      - name: Build deterministic versioned manifests and generation record
+        env:
+          PUBLISHED_AT: ${{ steps.contract.outputs.published_at }}
+        run: |
+          set -euo pipefail
+          node .release-scripts/scripts/generate-download-manifest.mjs r2-assets "$TAG" "$R2_PUBLIC_BASE_URL" r2-assets/manifest.json "$PUBLISHED_AT"
+          node .release-scripts/scripts/rewrite-updater-manifest.mjs r2-assets/latest.json "$TAG" "$GITHUB_REPOSITORY" "$R2_PUBLIC_BASE_URL" r2-assets/latest-r2.json
+          manifest_sha=$(sha256sum r2-assets/manifest.json | awk '{print $1}')
+          updater_sha=$(sha256sum r2-assets/latest-r2.json | awk '{print $1}')
+          jq -nS \
+            --arg tag "$TAG" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg releaseToolingSha "$RELEASE_TOOLING_SHA" \
+            --arg publishedAt "$PUBLISHED_AT" \
+            --arg manifestKey "$TAG/manifest.json" \
+            --arg manifestSha "$manifest_sha" \
+            --arg updaterKey "$TAG/latest-r2.json" \
+            --arg updaterSha "$updater_sha" \
+            '{
+              schemaVersion: 1,
+              tag: $tag,
+              sourceSha: $sourceSha,
+              releaseToolingSha: $releaseToolingSha,
+              publishedAt: $publishedAt,
+              objects: {
+                downloadManifest: {key: $manifestKey, sha256: $manifestSha},
+                updaterManifest: {key: $updaterKey, sha256: $updaterSha}
+              }
+            }' > r2-assets/generation.json
+      - name: Check whether this is still the latest stable release
+        id: latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          pub_date=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json publishedAt --jq .publishedAt)
-          node .release-scripts/scripts/generate-download-manifest.mjs r2-assets "$TAG" "$R2_PUBLIC_BASE_URL" manifest.json "$pub_date"
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          printf 'latest_tag=%s\n' "$latest" >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$TAG" ]; then
+            echo 'is_latest=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'is_latest=false' >> "$GITHUB_OUTPUT"
+            echo "::warning::$TAG is no longer latest ($latest); only immutable versioned objects will be written."
+          fi
 
-      - name: Rewrite updater manifest for R2
-        if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
-        run: |
-          set -euo pipefail
-          node .release-scripts/scripts/rewrite-updater-manifest.mjs r2-assets/latest.json "$TAG" "$GITHUB_REPOSITORY" "$R2_PUBLIC_BASE_URL" latest-r2.json
-
-      - name: Upload versioned assets to R2
-        if: steps.r2.outputs.configured == 'true'
+      - name: Upload write-once versioned objects
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           set -euo pipefail
-          # Versioned paths are write-once. Existing objects must carry the
-          # same SHA-256 metadata; never overwrite a published version.
-          shopt -s nullglob
-          for file in r2-assets/*; do
-            name=$(basename "$file")
-            case "$name" in
-              *.sig|latest.json) continue ;;
-            esac
-            key="$TAG/$name"
-            sha=$(sha256sum "$file" | awk '{print $1}')
-            if head=$(aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT" 2>/dev/null); then
-              remote_sha=$(printf '%s' "$head" | jq -r '.Metadata.sha256 // empty')
-              if [ "$remote_sha" != "$sha" ]; then
-                echo "::error::R2 object $key already exists with a different SHA-256; refusing overwrite."
-                exit 1
+          refs=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_source=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$remote_source" ] || remote_source=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_source" = "$SOURCE_SHA" ] || { echo "::error::Tag moved before R2 upload"; exit 1; }
+
+          mapfile -t entries < <(find r2-assets -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          mapfile -t files < <(find r2-assets -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+          [ "${#entries[@]}" -eq "${#files[@]}" ] || { echo "::error::R2 asset set contains a non-regular entry"; exit 1; }
+          [ "${#files[@]}" -eq 32 ] || { echo "::error::Expected 32 verified versioned objects, found ${#files[@]}"; exit 1; }
+
+          download_and_compare() {
+            local key="$1" expected="$2" tmp actual
+            tmp=$(mktemp)
+            if ! aws s3 cp "s3://$R2_BUCKET/$key" "$tmp" --endpoint-url "$R2_ENDPOINT" >/dev/null; then
+              rm -f "$tmp"; return 1
+            fi
+            actual=$(sha256sum "$tmp" | awk '{print $1}')
+            rm -f "$tmp"
+            [ "$actual" = "$expected" ] || { echo "::error::R2 object $key has SHA-256 $actual, expected $expected"; return 1; }
+          }
+          verify_immutable_object() {
+            local key="$1" expected_sha="$2" expected_etag="${3:-}" head stored_sha stored_etag
+            head=$(mktemp)
+            if ! aws s3api head-object --bucket "$R2_BUCKET" --key "$key" --endpoint-url "$R2_ENDPOINT" > "$head"; then
+              rm -f "$head"; return 1
+            fi
+            stored_sha=$(jq -r '.Metadata.sha256 // empty' "$head")
+            stored_etag=$(jq -r '.ETag // empty' "$head")
+            rm -f "$head"
+            [ "$stored_sha" = "$expected_sha" ] || { echo "::error::R2 object $key has unexpected sha256 metadata"; return 1; }
+            [ -n "$stored_etag" ] && [ "$stored_etag" != null ] || { echo "::error::R2 object $key has no ETag"; return 1; }
+            if [ -n "$expected_etag" ] && [ "$stored_etag" != "$expected_etag" ]; then
+              echo "::error::R2 object $key ETag changed after creation"; return 1
+            fi
+            download_and_compare "$key" "$expected_sha"
+            echo "Verified write-once object metadata, ETag, and bytes: $key"
+          }
+          put_immutable() {
+            local file="$1" key="$2" sha="$3" err response created_etag
+            err=$(mktemp)
+            if response=$(aws s3api put-object --bucket "$R2_BUCKET" --key "$key" --body "$file" --if-none-match '*' \
+              --metadata "sha256=$sha" --cache-control 'public, max-age=31536000, immutable' \
+              --endpoint-url "$R2_ENDPOINT" 2>"$err"); then
+              rm -f "$err"
+              created_etag=$(printf '%s' "$response" | jq -r '.ETag // empty')
+              [ -n "$created_etag" ] && [ "$created_etag" != null ] || { echo "::error::R2 creation returned no ETag for $key"; return 1; }
+              verify_immutable_object "$key" "$sha" "$created_etag"
+              return
+            fi
+            if ! grep -Eqi '412|PreconditionFailed|ConditionalRequestConflict|condition.*failed' "$err"; then
+              echo "::error::Conditional R2 write failed for $key:"; cat "$err"; rm -f "$err"; return 1
+            fi
+            rm -f "$err"
+            verify_immutable_object "$key" "$sha"
+          }
+          for name in "${files[@]}"; do
+            sha=$(sha256sum "r2-assets/$name" | awk '{print $1}')
+            put_immutable "r2-assets/$name" "$TAG/$name" "$sha"
+          done
+
+          for name in "${files[@]}"; do
+            expected_sha=$(sha256sum "r2-assets/$name" | awk '{print $1}')
+            public_verified=false
+            for attempt in $(seq 1 12); do
+              public_url="$R2_PUBLIC_BASE_URL/$TAG/$name?release_run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+              tmp=$(mktemp)
+              if curl --fail --silent --show-error --location --max-time 30 \
+                -H 'Cache-Control: no-cache' "$public_url" -o "$tmp"; then
+                public_sha=$(sha256sum "$tmp" | awk '{print $1}')
+                if [ "$public_sha" = "$expected_sha" ]; then public_verified=true; fi
               fi
-              echo "Preserving identical immutable R2 object: $key"
-              continue
-            fi
-            aws s3 cp "$file" "s3://$R2_BUCKET/$key" \
-              --metadata "sha256=$sha" \
-              --cache-control "public, max-age=31536000, immutable" \
-              --endpoint-url "$R2_ENDPOINT"
+              rm -f "$tmp"
+              [ "$public_verified" = true ] && break
+              [ "$attempt" -lt 12 ] && sleep 5
+            done
+            [ "$public_verified" = true ] || { echo "::error::Public versioned object $TAG/$name did not match its verified SHA-256"; exit 1; }
+            echo "Verified public versioned object: $TAG/$name"
           done
 
-      - name: Publish root manifests to R2
-        if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
+      - name: Commit the sole mutable latest pointer with CAS
+        if: steps.latest.outputs.is_latest == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.contract.outputs.release_id }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         run: |
           set -euo pipefail
-          # Re-verify right before touching the root manifests: a newer
-          # release may have been promoted while assets were downloading.
-          # Skipping then is safe — the newer release's own queued run
-          # publishes the newer manifests. An unresolvable API is still a
-          # hard failure, never a guess.
-          latest=""
-          for attempt in 1 2 3 4; do
-            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name || true)
-            if [ -n "$latest" ]; then
-              break
-            fi
-            if [ "$attempt" -lt 4 ]; then
-              sleep $((attempt * 10))
-            fi
-          done
-          if [ -z "$latest" ]; then
-            echo "::error::Could not re-verify the latest stable release before publishing root manifests; failing instead of guessing."
+          rm -rf root-commit
+          mkdir -p root-commit
+
+          verify_target() {
+            local phase="$1" latest refs remote_source
+            latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")
+            printf '%s' "$latest" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
+              .id == $id and .tag_name == $tag
+              and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+            ' >/dev/null || { echo "::error::Latest immutable release drifted $phase"; return 1; }
+            refs=$(git ls-remote --exit-code "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+            remote_source=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+            [ -n "$remote_source" ] || remote_source=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+            [ "$remote_source" = "$SOURCE_SHA" ] || { echo "::error::Tag moved $phase"; return 1; }
+          }
+
+          head_error=root-commit/head.err
+          if aws s3api head-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$R2_ENDPOINT" > root-commit/head.json 2>"$head_error"; then
+            root_state=present
+            previous_etag=$(jq -r '.ETag // empty' root-commit/head.json)
+            [ -n "$previous_etag" ] && [ "$previous_etag" != null ] || { echo "::error::Existing latest.json has no ETag"; exit 1; }
+            aws s3api get-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$R2_ENDPOINT" root-commit/previous.json >/dev/null
+          elif grep -Eqi '404|Not Found|NoSuchKey' "$head_error"; then
+            root_state=absent
+            previous_etag=''
+          else
+            echo "::error::Could not snapshot latest.json before CAS"
+            cat "$head_error"
             exit 1
           fi
-          if [ "$TAG" != "$latest" ]; then
-            echo "::warning::$TAG stopped being the latest stable release mid-run ($latest is); leaving root manifests untouched."
-            exit 0
-          fi
-          # Both manifests are replaced on every release — keep edge cache
-          # short. Uploaded after the assets they reference so an aborted run
-          # never leaves them pointing at missing files.
-          aws s3 cp manifest.json "s3://$R2_BUCKET/manifest.json" \
-            --content-type "application/json" \
-            --cache-control "public, max-age=300" \
-            --endpoint-url "$R2_ENDPOINT"
-          aws s3 cp latest-r2.json "s3://$R2_BUCKET/latest.json" \
-            --content-type "application/json" \
-            --cache-control "public, max-age=300" \
-            --endpoint-url "$R2_ENDPOINT"
 
-      - name: Prune old versions
-        if: steps.r2.outputs.configured == 'true' && steps.latest.outputs.is_latest == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-        run: |
-          set -euo pipefail
-          versions=$(aws s3 ls "s3://$R2_BUCKET/" --endpoint-url "$R2_ENDPOINT" \
-            | awk '$1 == "PRE" {print $2}' | tr -d '/' | grep -E '^v[0-9]' | sort -V || true)
-          count=$(printf '%s\n' "$versions" | grep -c . || true)
-          if [ "$count" -le "$KEEP_VERSIONS" ]; then
-            echo "Nothing to prune ($count versions, keeping up to $KEEP_VERSIONS)."
-            exit 0
+          expected_sha=$(sha256sum r2-assets/latest-r2.json | awk '{print $1}')
+          committed_etag="$previous_etag"
+          already_current=false
+          if [ "$root_state" = present ]; then
+            previous_sha=$(sha256sum root-commit/previous.json | awk '{print $1}')
+            [ "$previous_sha" = "$expected_sha" ] && already_current=true
           fi
-          printf '%s\n' "$versions" | head -n "-$KEEP_VERSIONS" | while read -r old; do
-            [ -n "$old" ] || continue
-            echo "Pruning s3://$R2_BUCKET/$old/"
-            aws s3 rm "s3://$R2_BUCKET/$old/" --recursive --endpoint-url "$R2_ENDPOINT"
+
+          verify_target 'immediately before the R2 root commit'
+          if [ "$already_current" = true ]; then
+            echo "Verified existing latest.json already matches $TAG."
+          elif [ "$root_state" = present ]; then
+            response=$(aws s3api put-object --bucket "$R2_BUCKET" --key latest.json --body r2-assets/latest-r2.json \
+              --if-match "$previous_etag" --content-type application/json \
+              --cache-control 'public, max-age=60, must-revalidate' --endpoint-url "$R2_ENDPOINT") || {
+                echo "::error::CAS update failed for latest.json"; exit 1;
+              }
+            committed_etag=$(printf '%s' "$response" | jq -r '.ETag // empty')
+          else
+            response=$(aws s3api put-object --bucket "$R2_BUCKET" --key latest.json --body r2-assets/latest-r2.json \
+              --if-none-match '*' --content-type application/json \
+              --cache-control 'public, max-age=60, must-revalidate' --endpoint-url "$R2_ENDPOINT") || {
+                echo "::error::CAS create failed for latest.json"; exit 1;
+              }
+            committed_etag=$(printf '%s' "$response" | jq -r '.ETag // empty')
+          fi
+          [ -n "$committed_etag" ] && [ "$committed_etag" != null ] || { echo "::error::latest.json commit returned no ETag"; exit 1; }
+
+          persisted_etag=$(aws s3api head-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$R2_ENDPOINT" --query ETag --output text)
+          [ "$persisted_etag" = "$committed_etag" ] || { echo "::error::latest.json changed after the conditional commit"; exit 1; }
+          aws s3api get-object --bucket "$R2_BUCKET" --key latest.json --endpoint-url "$R2_ENDPOINT" root-commit/persisted.json >/dev/null
+          persisted_sha=$(sha256sum root-commit/persisted.json | awk '{print $1}')
+          [ "$persisted_sha" = "$expected_sha" ] || { echo "::error::Persisted latest.json checksum mismatch"; exit 1; }
+          verify_target 'after the R2 root commit'
+
+          public_verified=false
+          for attempt in $(seq 1 12); do
+            public_url="$R2_PUBLIC_BASE_URL/latest.json?release_run=$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$attempt"
+            if curl --fail --silent --show-error --location --max-time 30 \
+              -H 'Cache-Control: no-cache' "$public_url" -o root-commit/public.json; then
+              public_sha=$(sha256sum root-commit/public.json | awk '{print $1}')
+              if [ "$public_sha" = "$expected_sha" ]; then
+                public_verified=true
+                break
+              fi
+            fi
+            [ "$attempt" -lt 12 ] && sleep 5
           done
+          [ "$public_verified" = true ] || { echo "::error::Public latest.json did not expose the committed updater manifest"; exit 1; }
+          verify_target 'after public latest.json verification'
+          echo "Published and verified the sole mutable R2 pointer latest.json for $TAG."

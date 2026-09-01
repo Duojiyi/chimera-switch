@@ -1,93 +1,425 @@
 name: Promote release
 
+run-name: ${{ (inputs.repair_r2 || github.event.client_payload.repair_r2) && 'Repair R2' || 'Promote' }} ${{ inputs.tag || github.event.client_payload.tag }} / ${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
+
 on:
+  repository_dispatch:
+    types: [promote-release-request]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Complete prerelease tag to promote (e.g. v3.20.1)"
+        description: "Release tag to promote or repair in R2 (e.g. v3.20.1)"
         required: true
         type: string
+      request_id:
+        description: "Unique correlation id for the R2 synchronization request"
+        required: false
+        type: string
+      repair_r2:
+        description: "Only repair R2 for an already stable release; never change GitHub release state"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
+# Serialize stable publication, R2 commit, repair, and every draft writer.
+# release.yml uses this exact global group too.
 concurrency:
-  group: promote-release-${{ inputs.tag }}
+  group: release-publisher
   cancel-in-progress: false
 
+env:
+  TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+  REPOSITORY: ${{ github.repository }}
+  UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
+
 jobs:
-  promote:
-    name: Promote verified prerelease
+  resolve-release:
+    name: Resolve and verify release provenance
     runs-on: ubuntu-22.04
-    environment: release
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      tag: ${{ steps.verify.outputs.tag }}
+      request_id: ${{ steps.request.outputs.request_id }}
+      release_id: ${{ steps.resolve.outputs.release_id }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      release_tooling_sha: ${{ steps.verify.outputs.release_tooling_sha }}
+      verification_tooling_sha: ${{ steps.resolve.outputs.verification_tooling_sha }}
+      workflow_run_id: ${{ steps.verify.outputs.workflow_run_id }}
+      workflow_run_attempt: ${{ steps.verify.outputs.workflow_run_attempt }}
+      asset_snapshot_sha256: ${{ steps.verify.outputs.asset_snapshot_sha256 }}
+      mode: ${{ steps.request.outputs.mode }}
     steps:
-      - name: Checkout trusted verification tooling
+      - name: Validate request and correlation id
+        id: request
+        env:
+          INPUT_REQUEST_ID: ${{ inputs.request_id || github.event.client_payload.request_id || '' }}
+          RAW_REPAIR_R2: ${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Promotion must run from the protected main branch"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$GITHUB_EVENT_ACTION" != promote-release-request ]; then
+            echo "::error::Unexpected repository_dispatch action"
+            exit 1
+          fi
+          case "$RAW_REPAIR_R2" in
+            true) mode=repair ;;
+            false|'') mode=promote ;;
+            *) echo "::error::repair_r2 must be a boolean"; exit 1 ;;
+          esac
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Tag must match vX.Y.Z"; exit 1; }
+          request_id="$INPUT_REQUEST_ID"
+          if [ -z "$request_id" ]; then
+            request_id="promote-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
+          fi
+          printf '%s' "$request_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || {
+            echo "::error::request_id must be 8-128 characters of [A-Za-z0-9._-]"
+            exit 1
+          }
+          printf 'request_id=%s\nmode=%s\n' "$request_id" "$mode" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve immutable release state
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE: ${{ steps.request.outputs.mode }}
+          RUN_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve protected main"; exit 1; }
+          [ "$main_sha" = "$RUN_SHA" ] || { echo "::error::Protected main moved ($main_sha != $RUN_SHA); rerun from the new tip"; exit 1; }
+
+          refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          source_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$source_sha" ] || source_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          printf '%s' "$source_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable source for $TAG"; exit 1; }
+          comparison=$(gh api "repos/$REPOSITORY/compare/$source_sha...$main_sha" --jq .status)
+          case "$comparison" in
+            ahead|identical) ;;
+            *) echo "::error::Release tag $TAG is not reachable from protected main ($comparison)"; exit 1 ;;
+          esac
+
+          matches=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --slurp \
+            | jq -c --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]')
+          [ "$(printf '%s' "$matches" | jq 'length')" -eq 1 ] || { echo "::error::Expected exactly one Release for $TAG"; exit 1; }
+          release=$(printf '%s' "$matches" | jq -c '.[0]')
+          release_id=$(printf '%s' "$release" | jq -r '.id // empty')
+          printf '%s' "$release_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Release returned an invalid id"; exit 1; }
+          expected_title="Chimera Switch $TAG"
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          if [ "$MODE" = repair ]; then
+            printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" '
+              .id == $id and .tag_name == $tag
+              and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+            ' >/dev/null || { echo "::error::$TAG must be the expected immutable stable release for R2 repair"; exit 1; }
+          else
+            printf '%s' "$release" | jq -e --argjson id "$release_id" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id
+              and .tag_name == $tag
+              and .draft == true
+              and .prerelease == false
+              and .name == $title
+              and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null || { echo "::error::$TAG is not the expected bot-owned complete draft"; exit 1; }
+          fi
+          printf 'release_id=%s\nsource_sha=%s\nverification_tooling_sha=%s\n' "$release_id" "$source_sha" "$main_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout protected verification tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: main
+          ref: ${{ steps.resolve.outputs.verification_tooling_sha }}
           sparse-checkout: scripts
           persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: '20'
-
-      - name: Download and verify every prerelease asset
+      - name: Download exact assets and verify signed provenance
+        id: verify
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
+          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+          VERIFICATION_TOOLING_SHA: ${{ steps.resolve.outputs.verification_tooling_sha }}
+          MODE: ${{ steps.request.outputs.mode }}
         run: |
           set -euo pipefail
-          if ! printf "%s" "$TAG" | grep -Eq "^v[0-9]+\.[0-9]+\.[0-9]+$"; then
-            echo "::error::Tag must match vX.Y.Z"
-            exit 1
+          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id"; exit 1; }
+          release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          expected_title="Chimera Switch $TAG"
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          if [ "$MODE" = repair ]; then
+            printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
+              .id == $id and .tag_name == $tag
+              and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+            ' >/dev/null || { echo "::error::Release changed from immutable stable during verification"; exit 1; }
+          else
+            printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag
+              and .draft == true and .prerelease == false
+              and .name == $title
+              and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null || { echo "::error::Draft identity changed during verification"; exit 1; }
           fi
-          release=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)
-          if [ "$(printf "%s" "$release" | jq -r .isDraft)" != false ] || [ "$(printf "%s" "$release" | jq -r .isPrerelease)" != true ]; then
-            echo "::error::$TAG must be an existing prerelease, not a draft or stable release."
-            exit 1
-          fi
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot.json
+          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG"
+          snapshot_sha=$(sha256sum release-asset-snapshot.json | awk '{print $1}')
           rm -rf release-assets
           mkdir -p release-assets
-          # Download without a pattern so verification sees the complete release.
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
-          node scripts/verify-release-assets.mjs release-assets "$TAG" "$GITHUB_REPOSITORY" release-assets/latest.json "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
+          while IFS=$'\t' read -r asset_id name; do
+            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
+            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
+            [ ! -e "release-assets/$name" ] || { echo "::error::Duplicate release asset name: $name"; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "release-assets/$name"
+            [ -s "release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG" release-assets
 
-      - name: Promote only after verification
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
-          echo "Promoted $TAG to the latest stable release."
+          node scripts/verify-release-assets.mjs release-assets "$TAG" "$REPOSITORY" release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
+            --require-user-assets --expected-source-sha="$SOURCE_SHA"
+          release_tooling_sha=$(jq -r .toolingSha release-assets/provenance.json)
+          workflow_run_id=$(jq -r .workflowRunId release-assets/provenance.json)
+          workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' release-assets/provenance.json)
+          printf '%s' "$release_tooling_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid release tooling SHA in provenance"; exit 1; }
+          printf '%s' "$workflow_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run id in provenance"; exit 1; }
+          printf '%s' "$workflow_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run attempt in provenance"; exit 1; }
+          comparison=$(gh api "repos/$REPOSITORY/compare/$release_tooling_sha...$VERIFICATION_TOOLING_SHA" --jq .status)
+          case "$comparison" in
+            ahead|identical) ;;
+            *) echo "::error::Historical release tooling is not an ancestor of current protected verification tooling ($comparison)"; exit 1 ;;
+          esac
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id")
+          printf '%s' "$run_info" | jq -e --arg repo "$REPOSITORY" --arg sha "$release_tooling_sha" --argjson attempt "$workflow_run_attempt" '
+            .path == ".github/workflows/release.yml"
+            and (.event == "workflow_dispatch" or .event == "repository_dispatch")
+            and .head_branch == "main"
+            and .head_sha == $sha
+            and .repository.full_name == $repo
+            and .run_attempt == $attempt
+            and .conclusion == "success"
+          ' >/dev/null || { echo "::error::Signed provenance is not bound to a successful protected release workflow run"; exit 1; }
 
-      # A GITHUB_TOKEN-authored release edit does not fan out to another
-      # workflow. Dispatch the mirror explicitly and wait for the real run so
-      # a green promotion cannot silently leave R2 stale.
-      - name: Dispatch and verify R2 synchronization
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          dispatched_at=$(date -u +%s)
-          gh workflow run sync-r2.yml --repo "$GITHUB_REPOSITORY" --ref main -f tag="$TAG"
-          sync_run_id=""
-          for attempt in $(seq 1 30); do
-            sync_run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sync-r2.yml --event workflow_dispatch --limit 20 \
-              --json databaseId,createdAt \
-              --jq "map(select((.createdAt | fromdateiso8601) >= $dispatched_at)) | .[0].databaseId // empty" || true)
-            if [ -n "$sync_run_id" ]; then
-              break
-            fi
-            sleep 2
-          done
-          if [ -z "$sync_run_id" ]; then
-            echo "::error::R2 synchronization was dispatched but no run appeared within 60 seconds."
-            exit 1
+          final_release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          if [ "$MODE" = repair ]; then
+            printf '%s' "$final_release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" '
+              .id == $id and .tag_name == $tag
+              and .draft == false and .prerelease == false
+              and .immutable == true and (.published_at != null)
+            ' >/dev/null || { echo "::error::Stable release identity changed during verification"; exit 1; }
+          else
+            printf '%s' "$final_release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+              .id == $id and .tag_name == $tag
+              and .draft == true and .prerelease == false
+              and .name == $title
+              and .author.login == "github-actions[bot]"
+              and ((.body // "") | contains($marker))
+            ' >/dev/null || { echo "::error::Draft identity changed during verification"; exit 1; }
           fi
-          echo "Waiting for R2 synchronization run $sync_run_id."
-          gh run watch "$sync_run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          printf '%s' "$final_release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot-final.json
+          node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot-final.json "$TAG"
+          cmp -s release-asset-snapshot.json release-asset-snapshot-final.json || { echo "::error::Release assets changed during verification"; exit 1; }
+          printf 'tag=%s\nrelease_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\n' \
+            "$TAG" "$release_tooling_sha" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" >> "$GITHUB_OUTPUT"
+
+  promote-stable:
+    name: Publish immutable stable release
+    if: needs.resolve-release.outputs.mode == 'promote'
+    needs: resolve-release
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout protected verification tooling
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.resolve-release.outputs.verification_tooling_sha }}
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Require immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is required for the immutable-release Administration read preflight"; exit 1; }
+          enabled=$(gh api "repos/$REPOSITORY/immutable-releases" --jq .enabled) || {
+            echo "::error::SYNC_TOKEN must be able to read repository Administration settings"
+            exit 1
+          }
+          [ "$enabled" = true ] || { echo "::error::Repository immutable releases must be enabled before stable publication"; exit 1; }
+
+      - name: Require mirror credentials
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+        run: |
+          set -euo pipefail
+          [ -n "$R2_ACCOUNT_ID" ] && [ -n "$AWS_ACCESS_KEY_ID" ] && [ -n "$AWS_SECRET_ACCESS_KEY" ] || {
+            echo "::error::R2 credentials must be configured before stable publication"
+            exit 1
+          }
+          R2_ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+          aws s3api head-bucket --bucket chimera-switch-releases --endpoint-url "$R2_ENDPOINT" >/dev/null || {
+            echo "::error::R2 credentials cannot access the release bucket; refusing irreversible publication"
+            exit 1
+          }
+
+      - name: Re-verify exact draft and publish once
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.resolve-release.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.resolve-release.outputs.source_sha }}
+          RELEASE_TOOLING_SHA: ${{ needs.resolve-release.outputs.release_tooling_sha }}
+          WORKFLOW_RUN_ID: ${{ needs.resolve-release.outputs.workflow_run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ needs.resolve-release.outputs.workflow_run_attempt }}
+          SNAPSHOT_SHA256: ${{ needs.resolve-release.outputs.asset_snapshot_sha256 }}
+        run: |
+          set -euo pipefail
+          refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$remote_sha" ] || remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_sha" = "$SOURCE_SHA" ] || { echo "::error::Tag moved before publication"; exit 1; }
+
+          release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          expected_title="Chimera Switch $TAG"
+          printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id before publication"; exit 1; }
+          printf '%s' "$release" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id
+            and .tag_name == $tag
+            and .draft == true
+            and .prerelease == false
+            and .name == $title
+            and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null || { echo "::error::Draft state or ownership changed before publication"; exit 1; }
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > draft-snapshot.json
+          node scripts/validate-release-asset-snapshot.mjs draft-snapshot.json "$TAG"
+          [ "$(sha256sum draft-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Draft asset identity snapshot changed"; exit 1; }
+
+          rm -rf release-assets
+          mkdir -p release-assets
+          while IFS=$'\t' read -r asset_id name; do
+            printf '%s' "$asset_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release asset id"; exit 1; }
+            printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+-]*$' || { echo "::error::Unsafe release asset name: $name"; exit 1; }
+            gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "release-assets/$name"
+          done < <(printf '%s' "$release" | jq -r '.assets[] | [.id,.name] | @tsv')
+          node scripts/validate-release-asset-snapshot.mjs draft-snapshot.json "$TAG" release-assets
+          node scripts/verify-release-assets.mjs release-assets "$TAG" "$REPOSITORY" release-assets/latest.json "$UPDATER_PUBLIC_KEY" \
+            --require-user-assets --expected-source-sha="$SOURCE_SHA" --expected-tooling-sha="$RELEASE_TOOLING_SHA"
+          [ "$(jq -r .workflowRunId release-assets/provenance.json)" = "$WORKFLOW_RUN_ID" ] || { echo "::error::Release workflow run binding changed"; exit 1; }
+          [ "$(jq -r .workflowRunAttempt release-assets/provenance.json)" = "$WORKFLOW_RUN_ATTEMPT" ] || { echo "::error::Release workflow attempt binding changed"; exit 1; }
+
+          final_draft=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$final_draft" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > draft-snapshot-final.json
+          node scripts/validate-release-asset-snapshot.mjs draft-snapshot-final.json "$TAG"
+          [ "$(sha256sum draft-snapshot-final.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Draft assets changed during final verification"; exit 1; }
+          printf '%s' "$final_draft" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == true and .prerelease == false
+            and .name == $title
+            and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null || { echo "::error::Draft identity changed during final verification"; exit 1; }
+
+          gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -F prerelease=false -f make_latest=true > published-release.json
+          jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+            and .name == $title
+            and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' published-release.json >/dev/null || {
+            echo "::error::GitHub did not return the expected immutable stable release state"; exit 1;
+          }
+          published=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$published" | jq -e --argjson id "$RELEASE_ID" --arg tag "$TAG" --arg title "$expected_title" --arg marker "$marker" '
+            .id == $id and .tag_name == $tag
+            and .draft == false and .prerelease == false
+            and .immutable == true and (.published_at != null)
+            and .name == $title
+            and .author.login == "github-actions[bot]"
+            and ((.body // "") | contains($marker))
+          ' >/dev/null || { echo "::error::Published release is not immutable stable"; exit 1; }
+          printf '%s' "$published" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > published-snapshot.json
+          node scripts/validate-release-asset-snapshot.mjs published-snapshot.json "$TAG" release-assets
+          [ "$(sha256sum published-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Published immutable asset snapshot differs from the verified draft"; exit 1; }
+
+          # GitHub creates a release attestation when an immutable release is
+          # published. Verify both the release-wide statement and every asset.
+          for attempt in $(seq 1 10); do
+            gh release verify "$TAG" --repo "$REPOSITORY" >/dev/null && break
+            [ "$attempt" -lt 10 ] || { echo "::error::GitHub immutable release attestation verification failed"; exit 1; }
+            sleep 3
+          done
+          while IFS= read -r file; do
+            verified=false
+            for attempt in $(seq 1 10); do
+              if gh release verify-asset "$TAG" "$file" --repo "$REPOSITORY" >/dev/null; then verified=true; break; fi
+              sleep 3
+            done
+            [ "$verified" = true ] || { echo "::error::GitHub release attestation failed for $(basename "$file")"; exit 1; }
+          done < <(find release-assets -maxdepth 1 -type f -print | sort)
+          [ "$(gh api "repos/$REPOSITORY/releases/latest" --jq .tag_name)" = "$TAG" ] || { echo "::error::$TAG was not selected as latest stable release"; exit 1; }
+          echo "Published and cryptographically verified immutable stable release $TAG."
+
+  authorize-repair:
+    name: Authorize read-only R2 repair
+    if: needs.resolve-release.outputs.mode == 'repair'
+    needs: resolve-release
+    runs-on: ubuntu-22.04
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm stable release snapshot without mutation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.resolve-release.outputs.release_id }}
+          SNAPSHOT_SHA256: ${{ needs.resolve-release.outputs.asset_snapshot_sha256 }}
+        run: |
+          set -euo pipefail
+          release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")
+          printf '%s' "$release" | jq -e '.draft == false and .prerelease == false and .immutable == true and (.published_at != null)' >/dev/null || {
+            echo "::error::R2 repair target is no longer a stable release"; exit 1;
+          }
+          printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > stable-snapshot.json
+          node scripts/validate-release-asset-snapshot.mjs stable-snapshot.json "$TAG"
+          [ "$(sha256sum stable-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Stable asset snapshot changed"; exit 1; }
+          echo "Authorized R2 repair with read-only GitHub Release permissions."
+
+  sync-r2:
+    name: Sync stable release to R2
+    needs: [resolve-release, promote-stable, authorize-repair]
+    if: >-
+      always()
+      && needs.resolve-release.result == 'success'
+      && ((needs.resolve-release.outputs.mode == 'repair'
+      && needs.authorize-repair.result == 'success')
+      || (needs.resolve-release.outputs.mode == 'promote'
+      && needs.promote-stable.result == 'success'))
+    uses: ./.github/workflows/sync-r2.yml
+    with:
+      tag: ${{ needs.resolve-release.outputs.tag }}
+      request_id: ${{ needs.resolve-release.outputs.request_id }}
+      source_sha: ${{ needs.resolve-release.outputs.source_sha }}
+      release_tooling_sha: ${{ needs.resolve-release.outputs.release_tooling_sha }}
+      verification_tooling_sha: ${{ needs.resolve-release.outputs.verification_tooling_sha }}
+    secrets:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

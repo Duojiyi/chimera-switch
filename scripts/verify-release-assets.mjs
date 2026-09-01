@@ -1,39 +1,56 @@
 #!/usr/bin/env node
 /**
- * Verify the signed updater assets and latest.json for a release.
+ * Verify a release asset set, its Minisign updater signatures, and latest.json.
  *
- * Usage: node scripts/verify-release-assets.mjs <assets-dir> <tag> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned]
+ * Usage:
+ *   node scripts/verify-release-assets.mjs <assets-dir> <tag> <owner/repo>
+ *     [latest.json|-] [tauri-public-key-base64]
+ *     [--unsigned] [--legacy] [--require-user-assets]
+ *     [--expected-source-sha=<sha>] [--expected-tooling-sha=<sha>]
  */
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { getReleaseAssetContract, releaseTagPattern } from "./release-asset-contract.mjs";
 
-const [assetsDir, tag, repo, latestJsonArg, publicKeyBase64, verificationMode] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const [assetsDir, tag, repo, latestJsonArg, publicKeyBase64] = args;
 const latestJsonPath = latestJsonArg === "-" ? undefined : latestJsonArg;
-const unsignedMode = verificationMode === "--unsigned";
-const tagPattern = /^v\d+\.\d+\.\d+$/;
+const unsignedMode = args.includes("--unsigned");
+const legacyMode = args.includes("--legacy");
+const requireUserAssets = args.includes("--require-user-assets");
+const expectedSourceSha = args.find((arg) => arg.startsWith("--expected-source-sha="))?.split("=", 2)[1];
+const expectedToolingSha = args.find((arg) => arg.startsWith("--expected-tooling-sha="))?.split("=", 2)[1];
+const tagPattern = releaseTagPattern;
+const shaPattern = /^[0-9a-f]{40}$/;
 const githubRepoPattern = /^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?$/;
+
 if (!assetsDir || !tagPattern.test(tag ?? "") || !githubRepoPattern.test(repo ?? "")) {
-  console.error("Usage: node scripts/verify-release-assets.mjs <assets-dir> <vX.Y.Z> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned]");
+  console.error("Usage: node scripts/verify-release-assets.mjs <assets-dir> <vX.Y.Z> <owner/repo> [latest.json|-] [tauri-public-key-base64] [--unsigned] [--legacy] [--require-user-assets] [--expected-source-sha=<sha>] [--expected-tooling-sha=<sha>]");
+  process.exit(1);
+}
+if (expectedSourceSha && !shaPattern.test(expectedSourceSha)) {
+  console.error(`Invalid expected source SHA: ${expectedSourceSha}`);
+  process.exit(1);
+}
+if (expectedToolingSha && !shaPattern.test(expectedToolingSha)) {
+  console.error(`Invalid expected tooling SHA: ${expectedToolingSha}`);
   process.exit(1);
 }
 
 const version = tag.slice(1);
-const required = {
-  mac: `Chimera-Switch-${tag}-macOS.tar.gz`,
-  windowsX64: `Chimera-Switch-${tag}-Windows.msi`,
-  windowsArm64: `Chimera-Switch-${tag}-Windows-arm64.msi`,
-  linuxX64: `Chimera-Switch-${tag}-Linux-x86_64.AppImage`,
-  linuxArm64: `Chimera-Switch-${tag}-Linux-arm64.AppImage`,
-};
-const expectedPlatforms = {
-  "darwin-aarch64": required.mac,
-  "darwin-x86_64": required.mac,
-  "windows-x86_64": required.windowsX64,
-  "windows-aarch64": required.windowsArm64,
-  "linux-x86_64": required.linuxX64,
-  "linux-aarch64": required.linuxArm64,
-};
+const {
+  updater,
+  expectedPlatforms,
+  requiredUpdater,
+  expectedUserAssets,
+  mandatoryUserAssets,
+  signableAssets,
+  expectedSignatures,
+  provenanceName,
+  provenanceSignatureName,
+  latestAssetName,
+} = getReleaseAssetContract(tag);
 const failures = [];
 
 const readRegularFile = (file, label) => {
@@ -50,10 +67,53 @@ const readRegularFile = (file, label) => {
   }
 };
 
+const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
+const assetsRoot = path.resolve(assetsDir);
+const assetsDirIsDirectory = fs.existsSync(assetsDir) && fs.statSync(assetsDir).isDirectory();
+const assetsOnDisk = assetsDirIsDirectory ? fs.readdirSync(assetsDir).sort() : [];
+if (!assetsDirIsDirectory) {
+  failures.push(`${assetsDir}: asset directory is missing or not a directory`);
+}
+const latestAbsolutePath = latestJsonPath ? path.resolve(latestJsonPath) : undefined;
+if (latestAbsolutePath && path.basename(latestAbsolutePath) !== latestAssetName) {
+  failures.push(`${latestJsonPath}: output filename must be ${latestAssetName}`);
+}
+const latestPathIsInAssetsDir = latestAbsolutePath && path.dirname(latestAbsolutePath) === assetsRoot;
+
+const allowed = new Set([...requiredUpdater, ...expectedUserAssets]);
+if (requireUserAssets) {
+  for (const name of mandatoryUserAssets) readRegularFile(path.join(assetsDir, name), name);
+}
+if (unsignedMode) {
+  for (const name of assetsOnDisk) {
+    if (!allowed.has(name)) failures.push(`unexpected release asset: ${name}`);
+  }
+} else {
+  for (const name of expectedSignatures) allowed.add(name);
+  allowed.add(provenanceName);
+  allowed.add(provenanceSignatureName);
+  if (latestJsonPath) allowed.add(latestAssetName);
+  for (const name of assetsOnDisk) {
+    if (!allowed.has(name)) failures.push(`unexpected release asset: ${name}`);
+  }
+}
+if (!unsignedMode && assetsOnDisk.includes(latestAssetName) && !latestJsonPath) {
+  failures.push(`${latestAssetName}: pass its path explicitly so it can be validated`);
+}
+
 const signatures = new Map();
-for (const name of Object.values(required)) {
-  readRegularFile(path.join(assetsDir, name), name);
-  if (!unsignedMode) {
+for (const name of requiredUpdater) readRegularFile(path.join(assetsDir, name), name);
+for (const name of signableAssets) {
+  const assetExists = assetsOnDisk.includes(name);
+  const signatureExists = assetsOnDisk.includes(`${name}.sig`);
+  const requiredSignature = requiredUpdater.includes(name) || (requireUserAssets && mandatoryUserAssets.includes(name));
+  if (unsignedMode) continue;
+  if (requiredSignature || assetExists || signatureExists) {
+    if (!assetExists) failures.push(`${name}: required signed asset is missing`);
+    if (!signatureExists) {
+      failures.push(`${name}.sig: required signature is missing`);
+      continue;
+    }
     const signature = readRegularFile(path.join(assetsDir, `${name}.sig`), `${name}.sig`);
     if (signature) {
       const text = signature.toString("utf8").trim();
@@ -69,7 +129,12 @@ const decodeTauriEnvelope = (encoded, label, expectedPrefix) => {
     failures.push(`${label}: not canonical base64`);
     return null;
   }
-  const decoded = Buffer.from(compact, "base64").toString("utf8");
+  const decodedBytes = Buffer.from(compact, "base64");
+  if (decodedBytes.toString("base64") !== compact) {
+    failures.push(`${label}: not canonical base64`);
+    return null;
+  }
+  const decoded = decodedBytes.toString("utf8");
   if (!decoded.startsWith(expectedPrefix) || decoded.includes("\0")) {
     failures.push(`${label}: decoded Minisign envelope has an unexpected format`);
     return null;
@@ -82,7 +147,12 @@ const parseBase64Line = (value, label) => {
     failures.push(`${label}: invalid base64 payload`);
     return null;
   }
-  return Buffer.from(value, "base64");
+  const decoded = Buffer.from(value, "base64");
+  if (decoded.toString("base64") !== value) {
+    failures.push(`${label}: non-canonical base64 payload`);
+    return null;
+  }
+  return decoded;
 };
 
 const parseMinisignPublicKey = (encoded) => {
@@ -98,44 +168,47 @@ const parseMinisignPublicKey = (encoded) => {
     failures.push("updater public key: invalid Minisign Ed25519 packet");
     return null;
   }
-  return {
-    keyId: packet.subarray(2, 10),
-    key: packet.subarray(10),
-  };
+  return { keyId: packet.subarray(2, 10), key: packet.subarray(10) };
 };
 
+const legacyTrustedNames = new Map([
+  [updater.mac, [`Chimera Switch.app.tar.gz`]],
+  [updater.windowsX64, [`Chimera Switch_${version}_x64_en-US.msi`]],
+  [updater.windowsArm64, [`Chimera Switch_${version}_arm64_en-US.msi`]],
+  [updater.linuxX64, [`Chimera Switch_${version}_amd64.AppImage`]],
+  [updater.linuxArm64, [`Chimera Switch_${version}_aarch64.AppImage`]],
+]);
+
 const verifyMinisign = (assetPath, signatureText, publicKey) => {
-  const envelope = decodeTauriEnvelope(
-    signatureText,
-    `${path.basename(assetPath)}.sig`,
-    "untrusted comment: signature from tauri secret key",
-  );
+  const name = path.basename(assetPath);
+  const envelope = decodeTauriEnvelope(signatureText, `${name}.sig`, "untrusted comment: signature from tauri secret key");
   if (!envelope) return false;
   const lines = envelope.replace(/\r/g, "").trimEnd().split("\n");
   if (lines.length < 4 || !lines[2].startsWith("trusted comment:")) {
-    failures.push(`${path.basename(assetPath)}.sig: incomplete Minisign signature envelope`);
+    failures.push(`${name}.sig: incomplete Minisign signature envelope`);
     return false;
   }
   const trustedComment = lines[2].slice("trusted comment:".length).trim();
   const fileComment = trustedComment.match(/(?:^|\t)file:([^\t]+)$/)?.[1];
-  if (fileComment !== path.basename(assetPath)) {
-    failures.push(`${path.basename(assetPath)}.sig: trusted comment file does not match the asset name`);
+  const acceptedNames = [name, ...(legacyMode ? legacyTrustedNames.get(name) ?? [] : [])];
+  if (!acceptedNames.includes(fileComment)) {
+    failures.push(`${name}.sig: trusted comment file does not match the asset name`);
     return false;
   }
-  const packet = parseBase64Line(lines[1], `${path.basename(assetPath)}.sig`);
-  const globalSignature = parseBase64Line(lines[3], `${path.basename(assetPath)}.sig global signature`);
+  const packet = parseBase64Line(lines[1], `${name}.sig`);
+  const globalSignature = parseBase64Line(lines[3], `${name}.sig global signature`);
   if (!packet || !globalSignature || packet.length !== 74 || globalSignature.length !== 64) return false;
   if (packet.subarray(0, 2).toString("ascii") !== "ED") {
-    failures.push(`${path.basename(assetPath)}.sig: unsupported Minisign algorithm`);
+    failures.push(`${name}.sig: unsupported Minisign algorithm`);
     return false;
   }
   if (!packet.subarray(2, 10).equals(publicKey.keyId)) {
-    failures.push(`${path.basename(assetPath)}.sig: key id does not match the configured updater public key`);
+    failures.push(`${name}.sig: key id does not match the configured updater public key`);
     return false;
   }
+
   let keyObject;
   try {
-    // RFC 8410 SubjectPublicKeyInfo wrapper for a raw Ed25519 public key.
     keyObject = crypto.createPublicKey({
       key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), publicKey.key]),
       format: "der",
@@ -146,43 +219,104 @@ const verifyMinisign = (assetPath, signatureText, publicKey) => {
     return false;
   }
   const message = fs.readFileSync(assetPath);
-  // Tauri's `ED` Minisign signatures use the standard pre-hashed mode:
-  // Ed25519 verifies the 64-byte BLAKE2b-512 digest, not the file bytes.
   const fileDigest = crypto.createHash("blake2b512").update(message).digest();
   if (!crypto.verify(null, fileDigest, keyObject, packet.subarray(10))) {
-    failures.push(`${path.basename(assetPath)}: cryptographic signature verification failed`);
+    failures.push(`${name}: cryptographic signature verification failed`);
     return false;
   }
-  // The trusted comment is authenticated by the global signature. Minisign
-  // signs the raw file signature followed by the comment content (without the
-  // `trusted comment: ` prefix or the envelope newline).
   const globalMessage = Buffer.concat([packet.subarray(10), Buffer.from(trustedComment)]);
   if (!crypto.verify(null, globalMessage, keyObject, globalSignature)) {
-    failures.push(`${path.basename(assetPath)}.sig: trusted-comment signature verification failed`);
+    failures.push(`${name}.sig: trusted-comment signature verification failed`);
     return false;
   }
   return true;
 };
 
-if (publicKeyBase64 && !unsignedMode) {
-  const publicKey = parseMinisignPublicKey(publicKeyBase64);
-  if (publicKey) {
-    for (const name of Object.values(required)) {
-      const signature = signatures.get(name);
-      if (signature) verifyMinisign(path.join(assetsDir, name), signature, publicKey);
+if (!unsignedMode) {
+  if (!publicKeyBase64) {
+    failures.push("updater public key is required in signed mode");
+  } else {
+    const publicKey = parseMinisignPublicKey(publicKeyBase64);
+    if (publicKey) {
+      for (const [name, signature] of signatures) {
+        if (assetsOnDisk.includes(name)) verifyMinisign(path.join(assetsDir, name), signature, publicKey);
+      }
+      const provenanceFile = readRegularFile(path.join(assetsDir, provenanceName), provenanceName);
+      const provenanceSignature = readRegularFile(path.join(assetsDir, provenanceSignatureName), provenanceSignatureName);
+      if (provenanceFile && provenanceSignature) {
+        verifyMinisign(path.join(assetsDir, provenanceName), provenanceSignature.toString("utf8").trim(), publicKey);
+      }
+    }
+  }
+}
+
+const parseJsonFile = (file, label) => {
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      failures.push(`${label}: JSON root must be a non-null object`);
+      return null;
+    }
+    return value;
+  } catch (error) {
+    failures.push(`${label}: invalid JSON (${error.message})`);
+    return null;
+  }
+};
+
+if (!unsignedMode) {
+  const provenance = parseJsonFile(path.join(assetsDir, provenanceName), provenanceName);
+  if (provenance !== null) {
+    if (provenance.schemaVersion !== 1) failures.push(`${provenanceName}: unsupported schemaVersion`);
+    if (provenance.repository !== repo) failures.push(`${provenanceName}: repository is not ${repo}`);
+    if (provenance.tag !== tag) failures.push(`${provenanceName}: tag is not ${tag}`);
+    if (!shaPattern.test(provenance.sourceSha ?? "")) failures.push(`${provenanceName}: sourceSha is not an immutable commit SHA`);
+    if (!shaPattern.test(provenance.toolingSha ?? "")) failures.push(`${provenanceName}: toolingSha is not an immutable commit SHA`);
+    if (!Number.isSafeInteger(provenance.workflowRunId) || provenance.workflowRunId <= 0) failures.push(`${provenanceName}: workflowRunId is invalid`);
+    if (provenance.workflowRunAttempt !== undefined && (!Number.isSafeInteger(provenance.workflowRunAttempt) || provenance.workflowRunAttempt <= 0)) failures.push(`${provenanceName}: workflowRunAttempt is invalid`);
+    if (expectedSourceSha && provenance.sourceSha !== expectedSourceSha) failures.push(`${provenanceName}: sourceSha does not match the validated release tag`);
+    if (expectedToolingSha && provenance.toolingSha !== expectedToolingSha) failures.push(`${provenanceName}: toolingSha does not match the reviewed tooling commit`);
+
+    // latest.json is deterministically assembled from the immutable source commit
+    // timestamp after signing. It is verified independently below, so it remains
+    // intentionally outside the signer provenance checksum set.
+    const actualChecksums = {};
+    for (const name of assetsOnDisk) {
+      if (name !== provenanceName && name !== provenanceSignatureName && name !== latestAssetName) {
+        actualChecksums[name] = sha256(fs.readFileSync(path.join(assetsDir, name)));
+      }
+    }
+    const expectedChecksums = provenance.assets;
+    if (!expectedChecksums || typeof expectedChecksums !== "object" || Array.isArray(expectedChecksums)) {
+      failures.push(`${provenanceName}: assets checksum map is missing`);
+    } else {
+      const actualNames = Object.keys(actualChecksums).sort();
+      const expectedNames = Object.keys(expectedChecksums).sort();
+      if (actualNames.length !== expectedNames.length || actualNames.some((name, index) => name !== expectedNames[index])) {
+        failures.push(`${provenanceName}: asset checksum map does not match the downloaded signed asset set`);
+      }
+      for (const name of expectedNames) {
+        if (!shaPattern.test(expectedChecksums[name] ?? "") || expectedChecksums[name] !== actualChecksums[name]) {
+          failures.push(`${provenanceName}: checksum mismatch for ${name}`);
+        }
+      }
     }
   }
 }
 
 if (latestJsonPath) {
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(latestJsonPath, "utf8"));
-  } catch (error) {
-    failures.push(`${latestJsonPath}: invalid JSON (${error.message})`);
+  const downloadedLatestPath = path.join(assetsRoot, latestAssetName);
+  if (!latestPathIsInAssetsDir && fs.existsSync(downloadedLatestPath)) {
+    try {
+      if (!fs.readFileSync(downloadedLatestPath).equals(fs.readFileSync(latestJsonPath))) {
+        failures.push(`${latestJsonPath}: differs from downloaded ${latestAssetName}`);
+      }
+    } catch (error) {
+      failures.push(`${latestJsonPath}: could not compare downloaded manifest (${error.message})`);
+    }
   }
-
-  if (manifest) {
+  const manifest = parseJsonFile(latestJsonPath, latestJsonPath);
+  if (manifest !== null) {
     if (manifest.version !== version) failures.push(`${latestJsonPath}: version is not ${version}`);
     if (!manifest.platforms || typeof manifest.platforms !== "object" || Array.isArray(manifest.platforms)) {
       failures.push(`${latestJsonPath}: platforms object missing`);
@@ -200,7 +334,6 @@ if (latestJsonPath) {
           failures.push(`${latestJsonPath}: ${platform} is missing a non-empty url or signature`);
           continue;
         }
-
         try {
           const url = new URL(entry.url);
           if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port || url.username || url.password || url.search || url.hash || url.pathname !== expectedPath) {
@@ -209,7 +342,6 @@ if (latestJsonPath) {
         } catch (error) {
           failures.push(`${latestJsonPath}: ${platform} has an invalid URL (${error.message})`);
         }
-
         const expectedSignature = signatures.get(fileName);
         if (expectedSignature && entry.signature.trim() !== expectedSignature) {
           failures.push(`${latestJsonPath}: ${platform} signature does not match ${fileName}.sig`);
@@ -224,8 +356,6 @@ if (failures.length) {
   for (const failure of failures) console.error(`  - ${failure}`);
   process.exit(1);
 }
-console.log(
-  unsignedMode
-    ? `[verify-release-assets] OK: ${Object.values(required).length} unsigned updater artifacts for ${tag}`
-    : `[verify-release-assets] OK: ${Object.values(required).length} updater artifacts, signatures, and six platform mappings for ${tag}`,
-);
+console.log(unsignedMode
+  ? `[verify-release-assets] OK: ${requiredUpdater.length} unsigned updater artifacts for ${tag}`
+  : `[verify-release-assets] OK: ${requiredUpdater.length} updater artifacts, signatures, provenance, and platform mappings for ${tag}`);

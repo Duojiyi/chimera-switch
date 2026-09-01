@@ -1,10 +1,10 @@
 name: Sync upstream
 
-# 上游 cc-switch（farion1231/cc-switch）发版后自动同步去广告版。
-# 同步使用 SYNC_TOKEN：必须能读写本仓库 Contents/Workflows，若保留 issue 通知还需
-# Issues 写权限。默认 GITHUB_TOKEN 不会触发本仓库后续的 tag release workflow。
-# release.yml 先以 prerelease 发布；完成人工验收后再转正，届时 sync-r2.yml 才会
-# 更新公开的 latest.json 和下载站根 manifest。
+# 上游 cc-switch（farion1231/cc-switch）发布稳定版后自动同步去广告版。
+# prepare job 只处理公开上游代码，publish job 才能接触 SYNC_TOKEN；两者之间只传
+# git bundle 和不可执行的元数据。发布先组装完整 draft，验证后由 promote-release 一次发布为不可变 stable。
+
+run-name: Sync upstream / ${{ github.run_id }}
 
 on:
   workflow_dispatch:
@@ -19,61 +19,47 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  prepare:
+    name: Prepare and test upstream candidate
     runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+      candidate_sha: ${{ steps.candidate.outputs.candidate_sha }}
+      skip: ${{ steps.check.outputs.skip }}
+      recovery: ${{ steps.check.outputs.recovery }}
+      release_required: ${{ steps.check.outputs.release_required }}
+      candidate_artifact_id: ${{ steps.upload-candidate.outputs.artifact-id }}
     steps:
-      - name: Validate sync token
-        env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SYNC_TOKEN" ]; then
-            echo "::error::SYNC_TOKEN is missing. Configure a repository-scoped PAT with Contents and Workflows write permission."
-            exit 1
-          fi
-          curl --fail --silent --show-error \
-            -H "Authorization: Bearer $SYNC_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPOSITORY" >/dev/null
-          scopes=$(curl --fail --silent --show-error --dump-header - -o /dev/null \
-            -H "Authorization: Bearer $SYNC_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/user | awk -F': ' 'tolower($1) == "x-oauth-scopes" {print tolower($2)}' | tr -d '\r')
-          # Classic OAuth/PAT tokens expose scopes. Fine-grained PATs do not, so
-          # an empty header is accepted and the real push/dispatch remains the final check.
-          if [ -n "$scopes" ] && ! printf '%s' "$scopes" | tr ',' '\n' | sed 's/^ *//' | grep -qx workflow; then
-            echo "::error::SYNC_TOKEN is a classic token without the workflow scope (scopes: $scopes)."
-            echo "Create a fine-grained PAT with Contents: Read and write and Workflows: Read and write, then replace the SYNC_TOKEN secret."
-            exit 1
-          fi
-          echo "SYNC_TOKEN can access $REPOSITORY"
-
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           ref: main
-          token: ${{ secrets.SYNC_TOKEN }}
-          # Do not leave the write-capable token in .git/config while upstream
-          # code is installed, formatted, typechecked, or tested.
           persist-credentials: false
 
       - name: Add and fetch upstream
         run: |
           set -euo pipefail
-          git remote add upstream https://github.com/farion1231/cc-switch.git 2>/dev/null || true
+          git remote add upstream https://github.com/farion1231/cc-switch.git
           git fetch upstream --tags --prune --force
+          git fetch origin --no-tags refs/heads/main
+
+      - name: Record protected main base
+        id: base
+        run: |
+          set -euo pipefail
+          base_sha=$(git rev-parse refs/remotes/origin/main)
+          printf '%s' "$base_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable main base SHA"; exit 1; }
+          printf 'base_sha=%s\n' "$base_sha" >> "$GITHUB_OUTPUT"
 
       - name: Detect latest upstream release tag
         id: upstream
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # /releases/latest is the upstream stable-release source of truth.
-          # If GitHub API resolution fails, stop loudly instead of guessing from
-          # tags, because a tag can exist without being a published stable release.
           release=$(gh api repos/farion1231/cc-switch/releases/latest)
           TAG=$(printf '%s' "$release" | jq -r '.tag_name // empty')
           if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -93,115 +79,102 @@ jobs:
           printf 'sha=%s\n' "$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "Latest upstream stable release: $TAG ($UPSTREAM_SHA)"
 
+      - name: Setup Node.js for release contract checks
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '20'
+
       - name: Check existing tag and release
         id: check
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          set +e
-          origin_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" 2>/dev/null)
-          origin_status=$?
-          set -e
-          if [ "$origin_status" -ne 0 ] && [ "$origin_status" -ne 2 ]; then
-            echo "::error::Could not inspect origin tag $TAG (git ls-remote exit $origin_status)."
-            exit 1
-          fi
+          echo 'skip=false' >> "$GITHUB_OUTPUT"
+          echo 'recovery=false' >> "$GITHUB_OUTPUT"
+          echo 'release_required=false' >> "$GITHUB_OUTPUT"
+          origin_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
           if [ -z "$origin_refs" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "Tag $TAG is not on origin; a normal upstream sync is required."
             exit 0
           fi
 
-          origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v tag_ref="refs/tags/$TAG^{}" '$2 == tag_ref { print $1; exit }')
+          origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1; exit}')
           if [ -z "$origin_tag_sha" ]; then
-            origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v tag_ref="refs/tags/$TAG" '$2 == tag_ref { print $1; exit }')
+            origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1; exit}')
           fi
-          if ! printf '%s' "$origin_tag_sha" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::error::Could not resolve immutable origin commit for tag $TAG"
-            exit 1
-          fi
-          # The local release tag points to the post-sync commit, which includes
-          # debranding and quality-gate changes after the upstream commit. It is
-          # therefore expected to differ from the upstream tag SHA. Verify the
-          # immutable tag instead by requiring the upstream commit in its history.
+          printf '%s' "$origin_tag_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable origin commit for $TAG"; exit 1; }
           if ! git cat-file -e "$origin_tag_sha^{commit}" 2>/dev/null; then
             git fetch --quiet --no-tags origin "$origin_tag_sha"
           fi
-          if ! git merge-base --is-ancestor "${{ steps.upstream.outputs.sha }}" "$origin_tag_sha"; then
-            echo "::error::Origin tag $TAG points to $origin_tag_sha without upstream commit ${{ steps.upstream.outputs.sha }} in its history; refusing to treat it as this upstream release."
-            exit 1
+          git merge-base --is-ancestor "$UPSTREAM_SHA" "$origin_tag_sha" || {
+            echo "::error::Origin tag $TAG does not contain upstream commit $UPSTREAM_SHA"; exit 1;
+          }
+          git merge-base --is-ancestor "$origin_tag_sha" origin/main || {
+            echo "::error::Origin tag $TAG is not reachable from protected main"; exit 1;
+          }
+
+          matches=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --slurp \
+            | jq -c --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]')
+          count=$(printf '%s' "$matches" | jq 'length')
+          if [ "$count" -eq 0 ]; then
+            echo "Release $TAG is missing; secure recovery will assemble a bot-owned draft."
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo 'recovery=true' >> "$GITHUB_OUTPUT"
+            echo 'release_required=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$count" -eq 1 ] || { echo "::error::Multiple releases unexpectedly match $TAG"; exit 1; }
+          release_data=$(printf '%s' "$matches" | jq -c '.[0]')
+          printf '%s' "$release_data" | jq -e '(.draft | type) == "boolean" and (.prerelease | type) == "boolean" and (.assets | type) == "array"' >/dev/null || {
+            echo "::error::Release $TAG returned malformed metadata"; exit 1;
+          }
+
+          printf '%s' "$release_data" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > release-asset-snapshot.json
+          complete=false
+          if node scripts/validate-release-asset-snapshot.mjs release-asset-snapshot.json "$TAG"; then
+            complete=true
+          else
+            echo "Release $TAG does not yet satisfy the exact immutable 29-asset contract."
           fi
 
-          echo "Tag $TAG already exists at immutable commit $origin_tag_sha and contains the upstream release commit. Checking whether its Release is complete."
-          release_data=$(gh release view "$TAG" --repo "$REPOSITORY" --json isDraft,isPrerelease,assets 2>/dev/null || true)
-          ready=true
-          if [ -z "$release_data" ] || [ "$(printf '%s' "$release_data" | jq -r '.isDraft')" != false ]; then
-            ready=false
+          is_draft=$(printf '%s' "$release_data" | jq -r .draft)
+          is_prerelease=$(printf '%s' "$release_data" | jq -r .prerelease)
+          if [ "$is_prerelease" = true ]; then
+            echo "::error::Legacy prerelease $TAG is unsupported; migrate it to the reviewed draft state before retrying"
+            exit 1
           fi
-          required=(
-            "Chimera-Switch-$TAG-macOS.tar.gz"
-            "Chimera-Switch-$TAG-macOS.tar.gz.sig"
-            "Chimera-Switch-$TAG-Windows.msi"
-            "Chimera-Switch-$TAG-Windows.msi.sig"
-            "Chimera-Switch-$TAG-Windows-arm64.msi"
-            "Chimera-Switch-$TAG-Windows-arm64.msi.sig"
-            "Chimera-Switch-$TAG-Linux-x86_64.AppImage"
-            "Chimera-Switch-$TAG-Linux-x86_64.AppImage.sig"
-            "Chimera-Switch-$TAG-Linux-arm64.AppImage"
-            "Chimera-Switch-$TAG-Linux-arm64.AppImage.sig"
-            "latest.json"
-          )
-          for asset in "${required[@]}"; do
-            if ! printf '%s' "$release_data" | jq -e --arg asset "$asset" '.assets[].name | select(. == $asset)' >/dev/null; then
-              echo "Missing Release asset: $asset"
-              ready=false
-            fi
-          done
-          if [ "$ready" = true ]; then
-            if [ "$(printf '%s' "$release_data" | jq -r '.isPrerelease')" = true ]; then
-              echo "Release $TAG is complete but remains a prerelease; manual promotion is required."
-              echo "prerelease_ready=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "Release $TAG is complete and stable; nothing to do."
-              echo "prerelease_ready=false" >> "$GITHUB_OUTPUT"
-            fi
-            echo "skip=true" >> "$GITHUB_OUTPUT"
+          if [ "$is_draft" = false ]; then
+            [ "$complete" = true ] || { echo "::error::Stable release $TAG is incomplete; refusing mutation"; exit 1; }
+            [ "$(printf '%s' "$release_data" | jq -r '.immutable // false')" = true ] || {
+              echo "::error::Stable release $TAG is not protected by GitHub immutable releases"; exit 1;
+            }
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo "Release $TAG is complete, immutable, and stable; nothing to do."
             exit 0
           fi
 
-          echo "Release $TAG is missing or incomplete; dispatching release.yml recovery."
-          dispatched_at=$(date -u +%s)
-          gh workflow run release.yml --repo "$REPOSITORY" --ref main -f tag="$TAG"
-          recovery_run_id=""
-          for attempt in $(seq 1 30); do
-            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event workflow_dispatch --limit 20 \
-              --json databaseId,createdAt \
-              --jq "map(select((.createdAt | fromdateiso8601) >= $dispatched_at)) | .[0].databaseId // empty" || true)
-            if [ -n "$recovery_run_id" ]; then
-              break
-            fi
-            sleep 2
-          done
-          if [ -z "$recovery_run_id" ]; then
-            echo "::error::Recovery workflow was dispatched but no run appeared within 60 seconds."
-            exit 1
-          fi
-          echo "Recovery workflow $recovery_run_id started; waiting for its actual result."
-          if ! gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status; then
-            echo "::error::Recovery workflow $recovery_run_id failed; upstream sync is incomplete."
-            exit 1
-          fi
-          echo "Recovery workflow $recovery_run_id completed successfully; upstream sync is complete."
-          echo "skip=true" >> "$GITHUB_OUTPUT"
+          marker='<!-- chimera-automated-release-draft:v1 -->'
+          expected_title="Chimera Switch $TAG"
+          printf '%s' "$release_data" | jq -e --arg sha "$origin_tag_sha" --arg title "$expected_title" --arg marker "$marker" '
+            .draft == true
+            and .prerelease == false
 
-      - name: Setup Node.js
-        if: steps.check.outputs.skip != 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: '20'
+            and .name == $title
+            and .author.login == "github-actions[bot]"
+            and (.body | contains($marker))
+          ' >/dev/null || { echo "::error::Existing draft is not the expected bot-owned automated draft"; exit 1; }
+          echo 'skip=true' >> "$GITHUB_OUTPUT"
+          echo 'recovery=true' >> "$GITHUB_OUTPUT"
+          if [ "$complete" != true ]; then
+            echo 'release_required=true' >> "$GITHUB_OUTPUT"
+            echo "Bot-owned draft $TAG is incomplete; release.yml will reconcile and complete it."
+          else
+            echo "Bot-owned draft $TAG is complete; recovery can proceed directly to promotion."
+          fi
 
       - name: Setup pnpm
         if: steps.check.outputs.skip != 'true'
@@ -210,253 +183,581 @@ jobs:
         run: |
           set -euo pipefail
           corepack enable
-          corepack install
+          corepack install --global pnpm@10.12.3
 
-      - name: Merge upstream (targeted conflict resolution)
-        id: merge
+      - name: Merge upstream with explicit conflict policy
         if: steps.check.outputs.skip != 'true'
         env:
-          TAG: ${{ steps.upstream.outputs.tag }}
           UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BASE_SHA=$(git rev-parse HEAD)
+          BASE_SHA="${{ steps.base.outputs.base_sha }}"
+          [ "$(git rev-parse HEAD)" = "$BASE_SHA" ] || { echo "::error::Checked-out HEAD is not the protected main base ($BASE_SHA)"; exit 1; }
 
           restore_trusted_paths() {
-            # Keep automation and release tooling from the checked-out origin
-            # baseline. This also removes newly added upstream files in these
-            # directories, not only conflicting files.
+            # Remove untracked and ignored files too: a quality-gate command must
+            # not be able to smuggle a new trusted script into the candidate.
+            git clean -ffdx -- .github scripts
             git rm -r -q --ignore-unmatch .github scripts || true
             git checkout "$BASE_SHA" -- .github scripts
             git add .github scripts
-            if ! git diff --cached --quiet; then
+            if ! git diff --cached --quiet -- .github scripts; then
               git commit --amend --no-edit
-              echo "Restored trusted .github and scripts from $BASE_SHA"
             fi
+            git clean -ffdx -- .github scripts
           }
 
           if git merge --no-edit --no-ff "$UPSTREAM_SHA"; then
             restore_trusted_paths
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          else
 
-          echo "合并冲突，按已知类别自动解决…"
+          echo "上游合并出现冲突，按已知类别解决。"
           UNRESOLVED=0
-          while IFS= read -r f; do
-            has_ours=$(git ls-files -u -- "$f" | awk '$3==2' | wc -l)
-            has_theirs=$(git ls-files -u -- "$f" | awk '$3==3' | wc -l)
-            case "$f" in
+          while IFS= read -r file; do
+            has_ours=$(git ls-files -u -- "$file" | awk '$3 == 2' | wc -l)
+            has_theirs=$(git ls-files -u -- "$file" | awk '$3 == 3' | wc -l)
+            case "$file" in
               src-tauri/tauri.conf.json|src-tauri/Info.plist|src-tauri/icons/*|README.md|README_*.md|.github/*|scripts/*|assets/*|flatpak/*|deplink.html|CONTRIBUTING.md|SECURITY.md|SUPPORT.md|CODE_OF_CONDUCT.md|.gitignore|.gitattributes|LICENSE)
-                if [ "$has_ours" -gt 0 ]; then
-                  git checkout --ours -- "$f" && git add -- "$f"
-                  echo "  ours   $f"
-                else
-                  git rm -q -f -- "$f"
-                  echo "  rm     $f"
-                fi ;;
+                if [ "$has_ours" -gt 0 ]; then git checkout --ours -- "$file" && git add -- "$file"; else git rm -q -f -- "$file"; fi ;;
               package.json|pnpm-lock.yaml|pnpm-workspace.yaml|src-tauri/Cargo.toml|src-tauri/Cargo.lock|src/*|src-tauri/*|tests/*|docs/*|CHANGELOG.md|index.html|session-manager.md|*.config.*|tsconfig*.json|components.json|.node-version|rust-toolchain.toml)
-                if [ "$has_ours" -eq 0 ] || [ "$has_theirs" -eq 0 ]; then
-                  git rm -q -f -- "$f"
-                  echo "  rm     $f"
-                else
-                  git checkout --theirs -- "$f" && git add -- "$f"
-                  echo "  theirs $f"
-                fi ;;
+                if [ "$has_ours" -eq 0 ] || [ "$has_theirs" -eq 0 ]; then git rm -q -f -- "$file"; else git checkout --theirs -- "$file" && git add -- "$file"; fi ;;
               *)
-                echo "  ??     $f（无既定策略）"
+                echo "::error::No conflict policy exists for $file"
                 UNRESOLVED=1 ;;
             esac
           done < <(git diff --name-only --diff-filter=U)
-
           if [ "$UNRESOLVED" -ne 0 ]; then
-            echo "存在无法自动解决的冲突路径，放弃合并。"
             git merge --abort || true
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            exit 1
           fi
           git commit --no-edit
           restore_trusted_paths
-          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Re-debrand, align version and run quality gates
-        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+      - name: Re-debrand, align version, and run quality gates
+        if: steps.check.outputs.skip != 'true'
         env:
           TAG: ${{ steps.upstream.outputs.tag }}
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
         run: |
           set -euo pipefail
+          restore_trusted_paths() {
+            # Each Actions step starts a fresh shell, so repeat the restore here
+            # before and after every command that can execute repository code.
+            git clean -ffdx -- .github scripts
+            git rm -r -q --ignore-unmatch .github scripts || true
+            git checkout "$BASE_SHA" -- .github scripts
+            git add .github scripts
+            if ! git diff --cached --quiet -- .github scripts; then
+              git commit --amend --no-edit
+            fi
+            git clean -ffdx -- .github scripts
+          }
           node scripts/debrand.mjs
           node scripts/align-version.mjs "${TAG#v}"
           cargo fmt --manifest-path src-tauri/Cargo.toml
-          pnpm install --frozen-lockfile
-          pnpm format
-          pnpm typecheck
-          pnpm test:unit
+          # Install dependencies without executing scripts from the upstream tree.
+          pnpm install --frozen-lockfile --ignore-scripts
+          # Call fixed binaries directly. Do not execute scripts from the
+          # upstream-controlled package.json during the trust-sensitive gate.
+          pnpm exec prettier --write "src/**/*.{js,jsx,ts,tsx,css,json}"
+          pnpm exec tsc --noEmit
+          pnpm exec vitest run
           node scripts/check-debrand.mjs
+          # The commands above run before this final restore, so their output
+          # cannot modify the trusted workflow or script set.
+          restore_trusted_paths
+          git diff --exit-code -- .github scripts
+          git diff --cached --exit-code -- .github scripts
           git add -A
-          git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
+          if git diff --cached --quiet; then
+            echo "Quality gates made no tracked changes."
+          else
+            git commit -m "sync: merge upstream $TAG and re-apply debrand"
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Working tree is dirty after quality gates; refusing to package an uncommitted candidate."
+            git status --short
+            exit 1
+          fi
 
-      - name: Create and merge sync PR
-        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
-        timeout-minutes: 90
+      - name: Package candidate bundle
+        id: candidate
+        if: steps.check.outputs.skip != 'true'
         env:
           TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          EXPECTED_BASE_SHA: ${{ steps.base.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          BASE_SHA="$EXPECTED_BASE_SHA"
+          printf '%s' "$BASE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Candidate base SHA is not an immutable commit"; exit 1; }
+          remote_main_sha=$(git rev-parse origin/main)
+          [ "$BASE_SHA" = "$remote_main_sha" ] || { echo "::error::Checked-out main is stale ($BASE_SHA != $remote_main_sha)"; exit 1; }
+          upstream_refs=$(git ls-remote --tags upstream "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_upstream_sha=$(printf '%s\n' "$upstream_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1; exit}')
+          [ -n "$remote_upstream_sha" ] || remote_upstream_sha=$(printf '%s\n' "$upstream_refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_upstream_sha" = "$UPSTREAM_SHA" ] || { echo "::error::Upstream tag $TAG moved after fetch ($remote_upstream_sha != $UPSTREAM_SHA)"; exit 1; }
+          # Preserve the exact tree that passed the quality gates, but discard
+          # the untrusted upstream merge history before anything is handed to a
+          # credentialed job. This also means a classic PAT with repo scope can
+          # push the candidate because no workflow commit is introduced.
+          TESTED_TREE=$(git rev-parse 'HEAD^{tree}')
+          git reset --soft "$BASE_SHA"
+          git commit -m "sync: merge upstream $TAG and re-apply debrand"
+          CANDIDATE_SHA=$(git rev-parse HEAD)
+          [ "$CANDIDATE_SHA" != "$BASE_SHA" ] || { echo "::error::Upstream sync produced no candidate commit"; exit 1; }
+          candidate_tree=$(git rev-parse "$CANDIDATE_SHA^{tree}")
+          [ "$candidate_tree" = "$TESTED_TREE" ] || { echo "::error::Sanitized candidate tree differs from the tested tree"; exit 1; }
+          candidate_parents=$(git show -s --format='%P' "$CANDIDATE_SHA")
+          set -- $candidate_parents
+          [ "$#" -eq 1 ] && [ "$1" = "$BASE_SHA" ] || { echo "::error::Candidate does not have protected main as its sole parent: $candidate_parents"; exit 1; }
+          [ "$(git rev-list --count "$BASE_SHA..$CANDIDATE_SHA")" -eq 1 ] || { echo "::error::Candidate contains unexpected intermediate history"; exit 1; }
+          git diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github scripts || { echo "::error::Sanitized candidate changes trusted workflow or script paths"; exit 1; }
+          [ -z "$(git status --porcelain)" ] || { echo "::error::Working tree changed while sanitizing the candidate"; exit 1; }
+          git branch --force sync-candidate "$CANDIDATE_SHA"
+          git bundle create "$RUNNER_TEMP/sync-candidate.bundle" sync-candidate --not "$BASE_SHA"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg upstream_sha "$UPSTREAM_SHA" \
+            --arg base_sha "$BASE_SHA" \
+            --arg candidate_sha "$CANDIDATE_SHA" \
+            '{schemaVersion: 1, tag: $tag, upstreamSha: $upstream_sha, baseSha: $base_sha, candidateSha: $candidate_sha}' \
+            > "$RUNNER_TEMP/sync-candidate.json"
+          printf 'base_sha=%s\n' "$BASE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'candidate_sha=%s\n' "$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Upload candidate bundle
+        if: steps.check.outputs.skip != 'true'
+        id: upload-candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: upstream-sync-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sync-candidate.bundle
+            ${{ runner.temp }}/sync-candidate.json
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified candidate
+    needs: prepare
+    if: needs.prepare.result == 'success' && (needs.prepare.outputs.skip != 'true' || needs.prepare.outputs.recovery == 'true')
+    runs-on: ubuntu-22.04
+    environment: automation
+    permissions:
+      actions: read
+      contents: read
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      UPSTREAM_SHA: ${{ needs.prepare.outputs.upstream_sha }}
+      BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
+      CANDIDATE_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - name: Validate sync token
+        if: needs.prepare.outputs.recovery == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is missing"; exit 1; }
+          gh api "repos/$REPOSITORY" >/dev/null
+
+      - name: Assemble missing or incomplete draft with exact run binding
+        id: recovery
+        if: needs.prepare.outputs.recovery == 'true' && needs.prepare.outputs.release_required == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$'
+          request_id="sync-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
+          expected_title="Release $TAG / $request_id"
+          dispatch_started_at=$(date -u +%s)
+          # repository_dispatch uses repository contents access and preserves
+          # an exact request identifier without requiring workflow mutation scope.
+          jq -n \
+            --arg tag "$TAG" \
+            --arg request_id "$request_id" \
+            --arg tooling_sha "$tooling_sha" \
+            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
+            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
+          recovery_run_id=""
+          for attempt in $(seq 1 30); do
+            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
+              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
+              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' || true)
+            [ -n "$recovery_run_id" ] && break
+            sleep 2
+          done
+          [ -n "$recovery_run_id" ] || { echo "::error::Could not bind the dispatched release run to request $request_id"; exit 1; }
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$recovery_run_id")
+          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
+          gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status
+          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Download candidate bundle
+        if: needs.prepare.outputs.recovery != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.candidate_artifact_id }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: candidate
+
+      - name: Push candidate and create protected sync PR
+        if: needs.prepare.outputs.recovery != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          local_sha=$(git rev-parse HEAD)
-          branch_name="automation/upstream-sync-$TAG"
-          push_root=$(mktemp -d)
-          trap 'rm -rf "$push_root"' EXIT
-          push_repo="$push_root/repository"
+          [ -n "${SYNC_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is missing"; exit 1; }
+          metadata=$(cat candidate/sync-candidate.json)
+          if ! printf '%s' "$metadata" | jq -e 'type == "object" and .schemaVersion == 1 and (.tag | type) == "string" and (.upstreamSha | type) == "string" and (.baseSha | type) == "string" and (.candidateSha | type) == "string"' >/dev/null; then
+            echo "::error::Candidate metadata does not match schemaVersion 1 object schema"
+            exit 1
+          fi
+          for field in tag upstreamSha baseSha candidateSha; do
+            value=$(printf '%s' "$metadata" | jq -r --arg field "$field" '.[$field]')
+            [ -n "$value" ] || { echo "::error::Candidate metadata is missing $field"; exit 1; }
+          done
+          printf '%s\n' "$(printf '%s' "$metadata" | jq -r .tag)" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Candidate tag has invalid format"; exit 1; }
+          for field in upstreamSha baseSha candidateSha; do
+            printf '%s\n' "$(printf '%s' "$metadata" | jq -r --arg field "$field" '.[$field]')" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Candidate metadata field $field is not an immutable SHA"; exit 1; }
+          done
+          [ "$(printf '%s' "$metadata" | jq -r .tag)" = "$TAG" ] || { echo "::error::Candidate tag mismatch"; exit 1; }
+          [ "$(printf '%s' "$metadata" | jq -r .upstreamSha)" = "$UPSTREAM_SHA" ] || { echo "::error::Candidate upstream SHA mismatch"; exit 1; }
+          [ "$(printf '%s' "$metadata" | jq -r .baseSha)" = "$BASE_SHA" ] || { echo "::error::Candidate base SHA mismatch"; exit 1; }
+          [ "$(printf '%s' "$metadata" | jq -r .candidateSha)" = "$CANDIDATE_SHA" ] || { echo "::error::Candidate commit SHA mismatch"; exit 1; }
 
-          # Never push a branch from the checkout that processed upstream files.
-          # The clean repository contains only the exact validated commit.
+          credential_file="$RUNNER_TEMP/sync-git-credentials"
+          trap 'rm -f "$credential_file"' EXIT
+          printf 'https://x-access-token:%s@github.com\n' "$SYNC_TOKEN" > "$credential_file"
+          chmod 600 "$credential_file"
+          git_auth() { git -c credential.helper= -c "credential.helper=store --file=$credential_file" "$@"; }
+
+          push_root=$(mktemp -d)
+          trap 'rm -rf "$push_root" "$credential_file"' EXIT
+          push_repo="$push_root/repository"
           git init --quiet "$push_repo"
           git -C "$push_repo" config user.name "github-actions[bot]"
           git -C "$push_repo" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$push_repo" remote add origin "https://github.com/$REPOSITORY.git"
-          git -C "$push_repo" -c protocol.file.allow=always fetch --quiet --no-tags "$GITHUB_WORKSPACE" HEAD
-          git -C "$push_repo" switch --quiet --create "$branch_name" FETCH_HEAD
+          git_auth -C "$push_repo" fetch --quiet --no-tags origin refs/heads/main
+          remote_main_sha=$(git -C "$push_repo" rev-parse FETCH_HEAD)
+          [ "$remote_main_sha" = "$BASE_SHA" ] || { echo "::error::origin/main moved while preparing the candidate ($remote_main_sha != $BASE_SHA)"; exit 1; }
 
-          remote_branch_sha=$(git ls-remote origin "refs/heads/$branch_name" | awk 'NR == 1 {print $1}')
-          if [ -n "$remote_branch_sha" ] && [ "$remote_branch_sha" != "$local_sha" ]; then
+          bundle_path="$PWD/candidate/sync-candidate.bundle"
+          git -C "$push_repo" fetch --quiet "$bundle_path" "refs/heads/sync-candidate:refs/remotes/bundle/candidate"
+          git -C "$push_repo" cat-file -e "$CANDIDATE_SHA^{commit}"
+          bundle_candidate_sha=$(git -C "$push_repo" rev-parse refs/remotes/bundle/candidate)
+          [ "$bundle_candidate_sha" = "$CANDIDATE_SHA" ] || { echo "::error::Bundle ref does not match candidate metadata"; exit 1; }
+          candidate_parents=$(git -C "$push_repo" show -s --format='%P' "$CANDIDATE_SHA")
+          set -- $candidate_parents
+          [ "$#" -eq 1 ] && [ "$1" = "$BASE_SHA" ] || { echo "::error::Candidate does not have protected main as its sole parent: $candidate_parents"; exit 1; }
+          [ "$(git -C "$push_repo" rev-list --count "$BASE_SHA..$CANDIDATE_SHA")" -eq 1 ] || { echo "::error::Candidate bundle contains unexpected intermediate history"; exit 1; }
+          git -C "$push_repo" diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github scripts || { echo "::error::Candidate changes trusted workflow or script paths"; exit 1; }
+
+          branch_name="automation/upstream-sync-$TAG"
+          remote_branch_sha=$(git_auth ls-remote origin "refs/heads/$branch_name" | awk 'NR == 1 {print $1}')
+          if [ -n "$remote_branch_sha" ] && [ "$remote_branch_sha" != "$CANDIDATE_SHA" ]; then
             echo "::error::Sync branch $branch_name already exists at a different commit; refusing to overwrite it."
             exit 1
           fi
           if [ -z "$remote_branch_sha" ]; then
-            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
-              push --atomic origin "HEAD:refs/heads/$branch_name"
-          else
-            echo "Reusing existing sync branch $branch_name at $remote_branch_sha."
+            git -C "$push_repo" switch --quiet --create "$branch_name" "$CANDIDATE_SHA"
+            git_auth -C "$push_repo" push --atomic origin "HEAD:refs/heads/$branch_name"
           fi
 
-          pr_number=$(GH_TOKEN="$SYNC_TOKEN" gh pr list --repo "$REPOSITORY" \
-            --head "$branch_name" --base main --state open --json number --jq '.[0].number // empty')
+          pr_number=$(gh pr list --repo "$REPOSITORY" --head "$branch_name" --base main --state open --json number --jq '.[0].number // empty')
           if [ -z "$pr_number" ]; then
-            pr_number=$(GH_TOKEN="$SYNC_TOKEN" gh pr create --repo "$REPOSITORY" \
-              --base main \
-              --head "$branch_name" \
+            pr_number=$(gh pr create --repo "$REPOSITORY" --base main --head "$branch_name" \
               --title "sync: merge upstream $TAG" \
-              --body "Automated upstream sync for $TAG. CI must pass before this PR is merged. Run: $RUN_URL")
+              --body "Automated upstream sync for $TAG. The candidate was prepared and tested without write credentials. Run: $RUN_URL")
           fi
           echo "Sync PR: #$pr_number"
 
-          # Do not rely solely on branch protection: this workflow must remain
-          # safe while protection is being configured or if it is accidentally
-          # weakened. Wait for the stable orchestration check explicitly.
+          api_repository="https://api.github.com/repos/$REPOSITORY"
+          encoded_branch=$(jq -rn --arg value "$branch_name" '$value | @uri')
+          ci_run_id=""
+          ci_run_attempt=""
           for attempt in $(seq 1 180); do
-            pr_data=$(GH_TOKEN="$SYNC_TOKEN" gh pr view "$pr_number" --repo "$REPOSITORY" \
-              --json state,statusCheckRollup)
-            if printf '%s' "$pr_data" | jq -e '.state == "CLOSED"' >/dev/null; then
-              echo "::error::Sync PR #$pr_number was closed before CI completed."
-              exit 1
+            pr_data=$(gh pr view "$pr_number" --repo "$REPOSITORY" \
+              --json state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,statusCheckRollup,mergeCommit)
+            if [ "$(printf '%s' "$pr_data" | jq -r .state)" = CLOSED ]; then
+              echo "::error::Sync PR #$pr_number was closed before CI completed."; exit 1
             fi
-            gate_conclusion=$(printf '%s' "$pr_data" | jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate") | .conclusion] | last // empty')
-            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
-            if [ "$failed_checks" -gt 0 ]; then
-              echo "::error::Sync PR #$pr_number has a failed status check."
-              exit 1
+            [ "$(printf '%s' "$pr_data" | jq -r .headRefName)" = "$branch_name" ] || { echo "::error::PR head branch changed"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r .headRefOid)" = "$CANDIDATE_SHA" ] || { echo "::error::PR head SHA changed from the tested candidate"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r '.headRepository.nameWithOwner // empty')" = "$REPOSITORY" ] || { echo "::error::PR head repository is not this repository"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r .baseRefName)" = main ] || { echo "::error::PR base branch changed"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r .baseRefOid)" = "$BASE_SHA" ] || { echo "::error::PR base SHA changed from the tested base"; exit 1; }
+            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | ((.conclusion // .state // "") | ascii_upcase) | select(IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
+            [ "$failed_checks" -eq 0 ] || { echo "::error::Sync PR #$pr_number has a failed status check"; exit 1; }
+
+            run_pages=$(gh api --paginate "repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&branch=$encoded_branch&per_page=100" --slurp)
+            matching_runs=$(printf '%s' "$run_pages" | jq -c \
+              --arg repo "$REPOSITORY" \
+              --arg api_repo "$api_repository" \
+              --arg branch "$branch_name" \
+              --arg head "$CANDIDATE_SHA" \
+              --arg base "$BASE_SHA" \
+              --argjson pr "$pr_number" '
+                [.[] | .workflow_runs[]
+                  | select(
+                    .path == ".github/workflows/ci.yml"
+                    and .event == "pull_request"
+                    and .head_branch == $branch
+                    and .head_sha == $head
+                    and .repository.full_name == $repo
+                    and ([.pull_requests[]?
+                      | select(
+                        .number == $pr
+                        and .head.ref == $branch
+                        and .head.sha == $head
+                        and .head.repo.url == $api_repo
+                        and .base.ref == "main"
+                        and .base.sha == $base
+                        and .base.repo.url == $api_repo
+                      )] | length) == 1
+                  )]
+                | sort_by(.created_at, .id)')
+            if [ "$(printf '%s' "$matching_runs" | jq 'length')" -gt 0 ]; then
+              ci_run=$(printf '%s' "$matching_runs" | jq -c 'last')
+              ci_run_id=$(printf '%s' "$ci_run" | jq -r '.id // empty')
+              ci_run_attempt=$(printf '%s' "$ci_run" | jq -r '.run_attempt // empty')
+              printf '%s' "$ci_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::CI workflow returned an invalid run id"; exit 1; }
+              printf '%s' "$ci_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::CI workflow returned an invalid run attempt"; exit 1; }
+              ci_status=$(printf '%s' "$ci_run" | jq -r .status)
+              ci_conclusion=$(printf '%s' "$ci_run" | jq -r '.conclusion // empty')
+              if [ "$ci_status" = completed ]; then
+                [ "$ci_conclusion" = success ] || { echo "::error::Exact CI workflow run $ci_run_id attempt $ci_run_attempt concluded $ci_conclusion"; exit 1; }
+                ci_jobs=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt/jobs?per_page=100" --slurp \
+                  | jq '[.[] | .jobs[]]')
+                printf '%s' "$ci_jobs" | jq -e --arg head "$CANDIDATE_SHA" --argjson attempt "$ci_run_attempt" '
+                  [.[] | select(
+                    .name == "CI Gate"
+                    and .workflow_name == "CI"
+                    and .head_sha == $head
+                    and .run_attempt == $attempt
+                    and .status == "completed"
+                    and .conclusion == "success"
+                  )] | length == 1
+                ' >/dev/null || { echo "::error::Exact CI run does not contain one successful CI Gate job"; exit 1; }
+                break
+              fi
             fi
-            if [ "$gate_conclusion" = "SUCCESS" ]; then
-              break
-            fi
-            if [ "$attempt" -eq 180 ]; then
-              echo "::error::CI Gate did not pass for sync PR #$pr_number within the timeout."
-              exit 1
-            fi
+            [ "$attempt" -lt 180 ] || { echo "::error::Exact pull_request CI workflow did not pass within the timeout"; exit 1; }
             sleep 30
           done
 
-          # Auto-merge is still used so required reviews/checks remain enforced;
-          # no admin bypass is used. CI Gate has already passed above.
-          GH_TOKEN="$SYNC_TOKEN" gh pr merge "$pr_number" --auto --squash --delete-branch
+          current_main=$(git_auth ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')
+          [ "$current_main" = "$BASE_SHA" ] || { echo "::error::main changed while CI was running; refusing to merge a stale candidate"; exit 1; }
+          pr_data=$(gh pr view "$pr_number" --repo "$REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid)
+          [ "$(printf '%s' "$pr_data" | jq -r .state)" = OPEN ] || { echo "::error::PR is no longer open"; exit 1; }
+          [ "$(printf '%s' "$pr_data" | jq -r .headRefName)" = "$branch_name" ] || { echo "::error::PR head branch changed before merge"; exit 1; }
+          [ "$(printf '%s' "$pr_data" | jq -r .headRefOid)" = "$CANDIDATE_SHA" ] || { echo "::error::PR head changed before merge"; exit 1; }
+          [ "$(printf '%s' "$pr_data" | jq -r '.headRepository.nameWithOwner // empty')" = "$REPOSITORY" ] || { echo "::error::PR head repository changed before merge"; exit 1; }
+          [ "$(printf '%s' "$pr_data" | jq -r .baseRefName)" = main ] || { echo "::error::PR base branch changed before merge"; exit 1; }
+          [ "$(printf '%s' "$pr_data" | jq -r .baseRefOid)" = "$BASE_SHA" ] || { echo "::error::PR base SHA changed before merge"; exit 1; }
+
+          final_ci_run=$(gh api "repos/$REPOSITORY/actions/runs/$ci_run_id")
+          printf '%s' "$final_ci_run" | jq -e \
+            --arg repo "$REPOSITORY" \
+            --arg api_repo "$api_repository" \
+            --arg branch "$branch_name" \
+            --arg head "$CANDIDATE_SHA" \
+            --arg base "$BASE_SHA" \
+            --argjson pr "$pr_number" \
+            --argjson attempt "$ci_run_attempt" '
+              .path == ".github/workflows/ci.yml"
+              and .event == "pull_request"
+              and .head_branch == $branch
+              and .head_sha == $head
+              and .repository.full_name == $repo
+              and .run_attempt == $attempt
+              and .status == "completed"
+              and .conclusion == "success"
+              and ([.pull_requests[]?
+                | select(
+                  .number == $pr
+                  and .head.ref == $branch
+                  and .head.sha == $head
+                  and .head.repo.url == $api_repo
+                  and .base.ref == "main"
+                  and .base.sha == $base
+                  and .base.repo.url == $api_repo
+                )] | length) == 1
+            ' >/dev/null || { echo "::error::Exact CI workflow run identity changed before merge"; exit 1; }
+          final_ci_jobs=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt/jobs?per_page=100" --slurp \
+            | jq '[.[] | .jobs[]]')
+          printf '%s' "$final_ci_jobs" | jq -e --arg head "$CANDIDATE_SHA" --argjson attempt "$ci_run_attempt" '
+            [.[] | select(
+              .name == "CI Gate"
+              and .workflow_name == "CI"
+              and .head_sha == $head
+              and .run_attempt == $attempt
+              and .status == "completed"
+              and .conclusion == "success"
+            )] | length == 1
+          ' >/dev/null || { echo "::error::CI Gate job identity changed before merge"; exit 1; }
+          # Merge immediately with a head SHA lock. Auto-merge would introduce a
+          # second race window in which the PR head or base could change after the
+          # checks above have passed.
+          gh pr merge "$pr_number" --repo "$REPOSITORY" --squash --delete-branch --match-head-commit "$CANDIDATE_SHA"
 
           merged_sha=""
           for attempt in $(seq 1 120); do
-            pr_data=$(GH_TOKEN="$SYNC_TOKEN" gh pr view "$pr_number" --repo "$REPOSITORY" \
-              --json state,mergeCommit,statusCheckRollup)
-            merged_sha=$(printf '%s' "$pr_data" | jq -r '.mergeCommit.oid // empty')
-            if printf '%s' "$pr_data" | jq -e '.state == "MERGED"' >/dev/null && [ -n "$merged_sha" ]; then
-              break
+            pr_data=$(gh pr view "$pr_number" --repo "$REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,statusCheckRollup,mergeCommit)
+            state=$(printf '%s' "$pr_data" | jq -r .state)
+            [ "$(printf '%s' "$pr_data" | jq -r .baseRefName)" = main ] || { echo "::error::PR base branch changed during merge"; exit 1; }
+            if [ "$state" = MERGED ]; then
+              merged_sha=$(printf '%s' "$pr_data" | jq -r '.mergeCommit.oid // empty')
+              [ -n "$merged_sha" ] && break
             fi
-            if printf '%s' "$pr_data" | jq -e '.state == "CLOSED"' >/dev/null; then
-              echo "::error::Sync PR #$pr_number was closed without merging."
-              exit 1
-            fi
-            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
-            if [ "$failed_checks" -gt 0 ]; then
-              echo "::error::Sync PR #$pr_number has failed required checks."
-              exit 1
-            fi
+            [ "$state" != CLOSED ] || { echo "::error::Sync PR #$pr_number closed without merging"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r .baseRefOid)" = "$BASE_SHA" ] || { echo "::error::PR base SHA changed during merge"; exit 1; }
+            [ "$(printf '%s' "$pr_data" | jq -r .headRefOid)" = "$CANDIDATE_SHA" ] || { echo "::error::PR head changed during merge"; exit 1; }
+            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | ((.conclusion // .state // "") | ascii_upcase) | select(IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
+            [ "$failed_checks" -eq 0 ] || { echo "::error::A required check failed while waiting for merge"; exit 1; }
+            [ "$attempt" -lt 120 ] || { echo "::error::PR was not merged within the timeout"; exit 1; }
             sleep 30
           done
-          if [ -z "$merged_sha" ]; then
-            echo "::error::Sync PR #$pr_number was not merged within the timeout."
-            exit 1
-          fi
+          printf '%s\n' "$merged_sha" | grep -Eq '^[0-9a-f]{40}$'
 
-          # Tag the exact protected main commit produced by the merge. Tags are
-          # write-once: an existing tag is accepted only at the same commit.
-          tag_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
-          remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v tag_ref="refs/tags/$TAG^{}" '$2 == tag_ref {print $1; exit}')
-          if [ -z "$remote_tag_sha" ]; then
-            remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v tag_ref="refs/tags/$TAG" '$2 == tag_ref {print $1; exit}')
-          fi
+          git_auth -C "$push_repo" fetch --quiet --no-tags origin refs/heads/main:refs/remotes/origin/main
+          remote_main_after_merge=$(git -C "$push_repo" rev-parse refs/remotes/origin/main)
+          [ "$remote_main_after_merge" = "$merged_sha" ] || { echo "::error::main does not point at the PR merge commit ($remote_main_after_merge != $merged_sha)"; exit 1; }
+          git_auth -C "$push_repo" fetch --quiet --no-tags origin "$merged_sha"
+          git -C "$push_repo" cat-file -e "$merged_sha^{commit}"
+          merged_parents=$(git -C "$push_repo" show -s --format='%P' "$merged_sha")
+          set -- $merged_parents
+          [ "$#" -eq 1 ] && [ "$1" = "$BASE_SHA" ] || { echo "::error::Squash merge has unexpected parent(s): $merged_parents"; exit 1; }
+          candidate_tree=$(git -C "$push_repo" rev-parse "$CANDIDATE_SHA^{tree}")
+          merged_tree=$(git -C "$push_repo" rev-parse "$merged_sha^{tree}")
+          [ "$candidate_tree" = "$merged_tree" ] || { echo "::error::Merged tree differs from the tested candidate tree"; exit 1; }
+          tag_refs=$(git_auth ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1; exit}')
+          [ -z "$remote_tag_sha" ] && remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1; exit}')
           if [ -n "$remote_tag_sha" ] && [ "$remote_tag_sha" != "$merged_sha" ]; then
-            echo "::error::Tag $TAG already exists at $remote_tag_sha, not merged commit $merged_sha."
-            exit 1
+            echo "::error::Tag $TAG already exists at $remote_tag_sha, not merged commit $merged_sha"; exit 1
           fi
           if [ -z "$remote_tag_sha" ]; then
-            # Squash merging creates a new commit that was not present in the
-            # pre-merge clean repository. Fetch the protected main history
-            # before creating the write-once tag, and verify the merge SHA is
-            # actually reachable from main.
-            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
-              fetch --quiet --no-tags origin refs/heads/main
-            if ! git -C "$push_repo" cat-file -e "$merged_sha^{commit}"; then
-              echo "::error::Merged PR commit $merged_sha is not available from origin/main."
-              exit 1
-            fi
-            if ! git -C "$push_repo" merge-base --is-ancestor "$merged_sha" FETCH_HEAD; then
-              echo "::error::Merged PR commit $merged_sha is not an ancestor of origin/main."
-              exit 1
-            fi
             git -C "$push_repo" tag -a "$TAG" "$merged_sha" -m "Release $TAG"
-            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
-              push --atomic origin "refs/tags/$TAG"
-          else
-            echo "Tag $TAG already points at the merged commit; leaving it untouched."
+            git_auth -C "$push_repo" push --atomic origin "refs/tags/$TAG"
           fi
 
-      - name: Notify conflict
-        if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          TAG: ${{ steps.upstream.outputs.tag }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Generate high-entropy release request id
+        id: request
+        shell: bash
         run: |
           set -euo pipefail
-          TITLE="sync: 手动合并上游 $TAG"
-          COUNT=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number --jq 'length' || echo 0)
-          if [ "$COUNT" -gt 0 ]; then exit 0; fi
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "自动合并上游 $TAG 出现无既定策略的冲突路径，需要人工处理。\n\n运行日志：$RUN_URL"
+          request_id="sync-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 16)"
+          printf '%s' "$request_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || { echo "::error::Generated request id has an invalid format"; exit 1; }
+          printf 'request_id=%s\n' "$request_id" >> "$GITHUB_OUTPUT"
 
-      - name: Notify failure (non-conflict)
-        if: failure() && steps.check.outputs.skip != 'true'
-        continue-on-error: true
+      - name: Dispatch and wait for release build
+        id: release
+        if: needs.prepare.outputs.recovery != 'true'
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          TAG: ${{ steps.upstream.outputs.tag || 'unknown' }}
+          REQUEST_ID: ${{ steps.request.outputs.request_id }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is missing"; exit 1; }
+          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve reviewed main SHA"; exit 1; }
+          expected_title="Release $TAG / $REQUEST_ID"
+          dispatch_started_at=$(date -u +%s)
+          # repository_dispatch avoids the classic PAT workflow scope while
+          # retaining an exact request id and protected-main binding.
+          jq -n \
+            --arg tag "$TAG" \
+            --arg request_id "$REQUEST_ID" \
+            --arg tooling_sha "$tooling_sha" \
+            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
+            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
+          release_run_id=""
+          for attempt in $(seq 1 30); do
+            release_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
+              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
+              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' \
+              2>/dev/null || true)
+            [ -n "$release_run_id" ] && break
+            sleep 2
+          done
+          [ -n "$release_run_id" ] || { echo "::error::Could not bind release run to request $REQUEST_ID"; exit 1; }
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$release_run_id")
+          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
+          echo "Waiting for exact release run $release_run_id (request $REQUEST_ID)."
+          gh run watch "$release_run_id" --repo "$REPOSITORY" --exit-status
+          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch and wait for stable promotion and R2 sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REQUEST_ID: ${{ steps.request.outputs.request_id }}
+        run: |
+          set -euo pipefail
+          TOOLING_SHA=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$TOOLING_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve protected main for promotion binding"; exit 1; }
+          expected_title="Promote $TAG / $REQUEST_ID"
+          dispatch_started_at=$(date -u +%s)
+          # repository_dispatch avoids the classic PAT workflow scope while
+          # retaining an exact request id and protected-main binding.
+          jq -n \
+            --arg tag "$TAG" \
+            --arg request_id "$REQUEST_ID" \
+            '{event_type: "promote-release-request", client_payload: {tag: $tag, request_id: $request_id}}' \
+            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
+          promote_run_id=""
+          for attempt in $(seq 1 30); do
+            promote_run_id=$(gh run list --repo "$REPOSITORY" --workflow promote-release.yml --event repository_dispatch --limit 50 \
+              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
+              | jq -r --arg title "$expected_title" --arg sha "$TOOLING_SHA" --argjson lower "$dispatch_started_at" \
+              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Promote release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' \
+              2>/dev/null || true)
+            [ -n "$promote_run_id" ] && break
+            sleep 2
+          done
+          [ -n "$promote_run_id" ] || { echo "::error::Could not bind promote run to request $REQUEST_ID"; exit 1; }
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$promote_run_id")
+          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$TOOLING_SHA" --argjson lower "$dispatch_started_at" \
+            '.path == ".github/workflows/promote-release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
+          echo "Waiting for exact promotion/R2 run $promote_run_id (request $REQUEST_ID)."
+          gh run watch "$promote_run_id" --repo "$REPOSITORY" --exit-status
+
+  notify:
+    name: Notify synchronization failure
+    needs: [prepare, publish]
+    if: always() && (needs.prepare.result == 'failure' || needs.publish.result == 'failure')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or reuse failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          TITLE="sync: 自动同步 $TAG 失败（非冲突）"
-          COUNT=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE\" in:title" --json number --jq 'length' || echo 0)
-          if [ "$COUNT" -gt 0 ]; then exit 0; fi
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "同步流水线在质量门禁或推送环节失败。\n\n运行日志：$RUN_URL"
+          [ -n "${GH_TOKEN:-}" ] || { echo "GITHUB_TOKEN is missing; cannot create failure issue"; exit 0; }
+          title="sync: 自动同步失败"
+          count=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number --jq 'length' || echo 0)
+          [ "$count" -gt 0 ] && exit 0
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+            --body "自动同步流水线失败，需要检查运行日志和保护规则。\n\n运行日志：$RUN_URL"
