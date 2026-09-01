@@ -267,14 +267,11 @@ jobs:
             exit 1
           fi
 
-          # 1) Collect .tar.gz (updater artifact)
+          # 1) Collect .tar.gz (updater artifact). The build signature is
+          # intentionally discarded; the protected signer signs this final
+          # published filename after all renaming is complete.
           NEW_TAR_GZ="Chimera-Switch-${VERSION}-macOS.tar.gz"
           cp "$TAR_GZ" "release-assets/$NEW_TAR_GZ"
-          if [ ! -f "$TAR_GZ.sig" ]; then
-            echo "❌ Signature for macOS updater artifact not found" >&2
-            exit 1
-          fi
-          cp "$TAR_GZ.sig" "release-assets/$NEW_TAR_GZ.sig"
           echo "macOS updater artifact copied: $NEW_TAR_GZ"
 
           # 2) Collect .app as zip
@@ -318,7 +315,7 @@ jobs:
           $targetRoot = if ($isArm64) { 'src-tauri/target/aarch64-pc-windows-msvc/release' } else { 'src-tauri/target/release' }
           $assetSuffix = if ($isArm64) { '-arm64' } else { '' }
 
-          # 仅打包 MSI 安装器 + .sig（用于 Updater）
+          # 仅打包 MSI 安装器。签名在受保护 job 中针对最终文件名生成。
           $msi = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/msi') -Recurse -Include *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($null -eq $msi) {
             # 兜底：全局搜索 .msi
@@ -328,10 +325,6 @@ jobs:
             $dest = "Chimera-Switch-$VERSION-Windows$assetSuffix.msi"
             Copy-Item $msi.FullName (Join-Path release-assets $dest)
             Write-Host "Installer copied: $dest"
-             # The build runner uses an ephemeral key only to satisfy Tauri's
-             # bundle step. The protected signer must create the final
-             # signature after this asset has its published name.
-             Write-Host "Temporary build signature intentionally not uploaded: $dest.sig"
           } else {
             throw "No Windows $assetSuffix MSI installer found"
           }
@@ -382,16 +375,12 @@ jobs:
           mkdir -p release-assets
           VERSION="$RELEASE_TAG"  # e.g., v3.5.0
           ARCH="${{ matrix.arch || 'x86_64' }}"
-          # Updater artifact: AppImage（含对应 .sig）
+          # Updater artifact. The build signature is intentionally discarded;
+          # the protected signer creates the final signature after renaming.
           APPIMAGE=$(find src-tauri/target/release/bundle -name "*.AppImage" | head -1 || true)
           if [ -n "$APPIMAGE" ]; then
             NEW_APPIMAGE="Chimera-Switch-${VERSION}-Linux-${ARCH}.AppImage"
             cp "$APPIMAGE" "release-assets/$NEW_APPIMAGE"
-            if [ ! -f "$APPIMAGE.sig" ]; then
-              echo "❌ Signature for AppImage updater artifact not found" >&2
-              exit 1
-            fi
-            cp "$APPIMAGE.sig" "release-assets/$NEW_APPIMAGE.sig"
             echo "AppImage copied: $NEW_APPIMAGE"
           else
             echo "❌ No AppImage found under target/release/bundle" >&2
@@ -507,21 +496,21 @@ jobs:
           fi
           KEY_PATH="$RUNNER_TEMP/tauri-signing.key"
           trap 'shred -u "$KEY_PATH" 2>/dev/null || rm -f "$KEY_PATH"' EXIT
-          RAW="$TAURI_SIGNING_PRIVATE_KEY"
-          if printf '%s' "$RAW" | head -n1 | grep -q '^untrusted comment:'; then
-            printf '%s' "$RAW" > "$KEY_PATH"
-            printf '\n' >> "$KEY_PATH"
-          elif DECODED=$(printf '%s' "$RAW" | base64 --decode 2>/dev/null) && printf '%s' "$DECODED" | head -n1 | grep -q '^untrusted comment:'; then
-            printf '%s' "$DECODED" > "$KEY_PATH"
-            printf '\n' >> "$KEY_PATH"
-          else
-            ONE=$(printf '%s' "$RAW" | tr -d '\r' | tr -d '\n')
-            if ! printf '%s' "$ONE" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
-              echo "::error::TAURI_SIGNING_PRIVATE_KEY format is invalid"
-              exit 1
-            fi
-            printf '%s\n%s\n' 'untrusted comment: tauri signing key' "$ONE" > "$KEY_PATH"
+          # Tauri stores this secret as one base64 string whose decoded
+          # payload is the minisign/rsign encrypted secret-key envelope. Keep
+          # the outer encoding intact: tauri signer expects that representation
+          # in --private-key-path and rejects the decoded envelope as malformed.
+          ONE=$(printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" | tr -d '\r' | tr -d '\n')
+          if ! printf '%s' "$ONE" | grep -Eq '^[A-Za-z0-9+/]+={0,2}$' || [ $(( ${#ONE} % 4 )) -ne 0 ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY must be canonical base64"
+            exit 1
           fi
+          DECODED=$(printf '%s' "$ONE" | base64 --decode 2>/dev/null || true)
+          if ! printf '%s' "$DECODED" | head -n1 | grep -q '^untrusted comment: rsign encrypted secret key$'; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not a Tauri rsign private-key envelope"
+            exit 1
+          fi
+          printf '%s\n' "$ONE" > "$KEY_PATH"
           chmod 600 "$KEY_PATH"
           required=(
             "Chimera-Switch-$RELEASE_TAG-macOS.tar.gz"

@@ -53,6 +53,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          ref: main
           token: ${{ secrets.SYNC_TOKEN }}
           # Do not leave the write-capable token in .git/config while upstream
           # code is installed, formatted, typechecked, or tested.
@@ -297,45 +298,139 @@ jobs:
           git add -A
           git commit -m "sync: merge upstream $TAG and re-apply debrand" || echo "nothing to commit"
 
-      - name: Push main and immutable tag from a clean repository
+      - name: Create and merge sync PR
         if: steps.check.outputs.skip != 'true' && steps.merge.outputs.conflict == 'false'
+        timeout-minutes: 90
         env:
           TAG: ${{ steps.upstream.outputs.tag }}
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           local_sha=$(git rev-parse HEAD)
-          refs=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
-          remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
-          if [ -z "$remote_sha" ]; then
-            remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
-          fi
-
-          # Check the immutable release tag before changing main, so a conflict
-          # cannot leave the repository half-updated.
-          if [ -n "$remote_sha" ] && [ "$remote_sha" != "$local_sha" ]; then
-            echo "::error::Tag $TAG already exists at $remote_sha, refusing to overwrite it (local HEAD: $local_sha)."
-            exit 1
-          fi
-
-          # Do not push from the checkout that processed upstream-controlled files.
-          # A fresh repository has no upstream remote, checkout config, or hooks.
+          branch_name="automation/upstream-sync-$TAG"
           push_root=$(mktemp -d)
           trap 'rm -rf "$push_root"' EXIT
           push_repo="$push_root/repository"
+
+          # Never push a branch from the checkout that processed upstream files.
+          # The clean repository contains only the exact validated commit.
           git init --quiet "$push_repo"
           git -C "$push_repo" config user.name "github-actions[bot]"
           git -C "$push_repo" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$push_repo" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git -C "$push_repo" remote add origin "https://github.com/$REPOSITORY.git"
           git -C "$push_repo" -c protocol.file.allow=always fetch --quiet --no-tags "$GITHUB_WORKSPACE" HEAD
-          git -C "$push_repo" switch --quiet --create main FETCH_HEAD
-          if [ -n "$remote_sha" ]; then
-            echo "Tag $TAG already points at $remote_sha; pushing main only."
-            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" push --atomic origin main
+          git -C "$push_repo" switch --quiet --create "$branch_name" FETCH_HEAD
+
+          remote_branch_sha=$(git ls-remote origin "refs/heads/$branch_name" | awk 'NR == 1 {print $1}')
+          if [ -n "$remote_branch_sha" ] && [ "$remote_branch_sha" != "$local_sha" ]; then
+            echo "::error::Sync branch $branch_name already exists at a different commit; refusing to overwrite it."
+            exit 1
+          fi
+          if [ -z "$remote_branch_sha" ]; then
+            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
+              push --atomic origin "HEAD:refs/heads/$branch_name"
           else
-            git -C "$push_repo" tag "$TAG" HEAD
-            # Update main and create the new tag as one remote transaction.
-            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" push --atomic origin main "refs/tags/$TAG"
+            echo "Reusing existing sync branch $branch_name at $remote_branch_sha."
+          fi
+
+          pr_number=$(GH_TOKEN="$SYNC_TOKEN" gh pr list --repo "$REPOSITORY" \
+            --head "$branch_name" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr_number" ]; then
+            pr_number=$(GH_TOKEN="$SYNC_TOKEN" gh pr create --repo "$REPOSITORY" \
+              --base main \
+              --head "$branch_name" \
+              --title "sync: merge upstream $TAG" \
+              --body "Automated upstream sync for $TAG. CI must pass before this PR is merged. Run: $RUN_URL")
+          fi
+          echo "Sync PR: #$pr_number"
+
+          # Do not rely solely on branch protection: this workflow must remain
+          # safe while protection is being configured or if it is accidentally
+          # weakened. Wait for the stable orchestration check explicitly.
+          for attempt in $(seq 1 180); do
+            pr_data=$(GH_TOKEN="$SYNC_TOKEN" gh pr view "$pr_number" --repo "$REPOSITORY" \
+              --json state,statusCheckRollup)
+            if printf '%s' "$pr_data" | jq -e '.state == "CLOSED"' >/dev/null; then
+              echo "::error::Sync PR #$pr_number was closed before CI completed."
+              exit 1
+            fi
+            gate_conclusion=$(printf '%s' "$pr_data" | jq -r '[.statusCheckRollup[]? | select(.name == "CI Gate") | .conclusion] | last // empty')
+            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
+            if [ "$failed_checks" -gt 0 ]; then
+              echo "::error::Sync PR #$pr_number has a failed status check."
+              exit 1
+            fi
+            if [ "$gate_conclusion" = "SUCCESS" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 180 ]; then
+              echo "::error::CI Gate did not pass for sync PR #$pr_number within the timeout."
+              exit 1
+            fi
+            sleep 30
+          done
+
+          # Auto-merge is still used so required reviews/checks remain enforced;
+          # no admin bypass is used. CI Gate has already passed above.
+          GH_TOKEN="$SYNC_TOKEN" gh pr merge "$pr_number" --auto --squash --delete-branch
+
+          merged_sha=""
+          for attempt in $(seq 1 120); do
+            pr_data=$(GH_TOKEN="$SYNC_TOKEN" gh pr view "$pr_number" --repo "$REPOSITORY" \
+              --json state,mergeCommit,statusCheckRollup)
+            merged_sha=$(printf '%s' "$pr_data" | jq -r '.mergeCommit.oid // empty')
+            if printf '%s' "$pr_data" | jq -e '.state == "MERGED"' >/dev/null && [ -n "$merged_sha" ]; then
+              break
+            fi
+            if printf '%s' "$pr_data" | jq -e '.state == "CLOSED"' >/dev/null; then
+              echo "::error::Sync PR #$pr_number was closed without merging."
+              exit 1
+            fi
+            failed_checks=$(printf '%s' "$pr_data" | jq '[.statusCheckRollup[]? | select((.conclusion // .state // "") | IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"))] | length')
+            if [ "$failed_checks" -gt 0 ]; then
+              echo "::error::Sync PR #$pr_number has failed required checks."
+              exit 1
+            fi
+            sleep 30
+          done
+          if [ -z "$merged_sha" ]; then
+            echo "::error::Sync PR #$pr_number was not merged within the timeout."
+            exit 1
+          fi
+
+          # Tag the exact protected main commit produced by the merge. Tags are
+          # write-once: an existing tag is accepted only at the same commit.
+          tag_refs=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v tag_ref="refs/tags/$TAG^{}" '$2 == tag_ref {print $1; exit}')
+          if [ -z "$remote_tag_sha" ]; then
+            remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v tag_ref="refs/tags/$TAG" '$2 == tag_ref {print $1; exit}')
+          fi
+          if [ -n "$remote_tag_sha" ] && [ "$remote_tag_sha" != "$merged_sha" ]; then
+            echo "::error::Tag $TAG already exists at $remote_tag_sha, not merged commit $merged_sha."
+            exit 1
+          fi
+          if [ -z "$remote_tag_sha" ]; then
+            # Squash merging creates a new commit that was not present in the
+            # pre-merge clean repository. Fetch the protected main history
+            # before creating the write-once tag, and verify the merge SHA is
+            # actually reachable from main.
+            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
+              fetch --quiet --no-tags origin refs/heads/main
+            if ! git -C "$push_repo" cat-file -e "$merged_sha^{commit}"; then
+              echo "::error::Merged PR commit $merged_sha is not available from origin/main."
+              exit 1
+            fi
+            if ! git -C "$push_repo" merge-base --is-ancestor "$merged_sha" FETCH_HEAD; then
+              echo "::error::Merged PR commit $merged_sha is not an ancestor of origin/main."
+              exit 1
+            fi
+            git -C "$push_repo" tag -a "$TAG" "$merged_sha" -m "Release $TAG"
+            git -C "$push_repo" -c "http.extraheader=AUTHORIZATION: bearer $SYNC_TOKEN" \
+              push --atomic origin "refs/tags/$TAG"
+          else
+            echo "Tag $TAG already points at the merged commit; leaving it untouched."
           fi
 
       - name: Notify conflict

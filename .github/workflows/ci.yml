@@ -254,3 +254,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+
+  ci-gate:
+    name: CI Gate
+    runs-on: ubuntu-22.04
+    needs: [changes, frontend, backend, backend-windows-wsl2]
+    if: always()
+    steps:
+      - name: Require successful CI orchestration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.changes.result }}" != "success" ||
+                "${{ needs.frontend.result }}" == "failure" ||
+                "${{ needs.frontend.result }}" == "cancelled" ||
+                "${{ needs.backend.result }}" == "failure" ||
+                "${{ needs.backend.result }}" == "cancelled" ||
+                "${{ needs.backend-windows-wsl2.result }}" == "failure" ||
+                "${{ needs.backend-windows-wsl2.result }}" == "cancelled" ]]; then
+            echo "::error::A required CI job failed or was cancelled."
+            exit 1
+          fi
+          echo "CI Gate passed (skipped area-specific jobs are allowed)."
