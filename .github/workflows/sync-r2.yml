@@ -29,16 +29,21 @@ on:
         description: 'Current protected-main commit whose verification scripts are executed'
         required: true
         type: string
+      require_r2:
+        description: 'Fail instead of skipping when R2 credentials are not configured'
+        required: false
+        default: true
+        type: boolean
     secrets:
       R2_ACCOUNT_ID:
         description: 'Cloudflare account that owns the release bucket'
-        required: true
+        required: false
       R2_ACCESS_KEY_ID:
         description: 'R2 S3-compatible access key id'
-        required: true
+        required: false
       R2_SECRET_ACCESS_KEY:
         description: 'R2 S3-compatible secret access key'
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -62,8 +67,49 @@ env:
   UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
 
 jobs:
+  r2-credentials:
+    name: Resolve R2 mirror availability
+    runs-on: ubuntu-22.04
+    environment: release
+    outputs:
+      configured: ${{ steps.resolve.outputs.configured }}
+    steps:
+      - name: Resolve complete R2 credential set
+        id: resolve
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          REQUIRE_R2: ${{ inputs.require_r2 }}
+        run: |
+          set -euo pipefail
+          configured=0
+          [ -n "$R2_ACCOUNT_ID" ] && configured=$((configured + 1))
+          [ -n "$R2_ACCESS_KEY_ID" ] && configured=$((configured + 1))
+          [ -n "$R2_SECRET_ACCESS_KEY" ] && configured=$((configured + 1))
+          case "$configured" in
+            3)
+              echo 'configured=true' >> "$GITHUB_OUTPUT"
+              echo 'A complete R2 credential set is configured; mirror synchronization will run.'
+              ;;
+            0)
+              echo 'configured=false' >> "$GITHUB_OUTPUT"
+              if [ "$REQUIRE_R2" = true ]; then
+                echo '::error::R2 repair requires R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY'
+                exit 1
+              fi
+              echo '::notice::R2 credentials are not configured; the GitHub release remains authoritative and mirror synchronization is skipped'
+              ;;
+            *)
+              echo '::error::R2 credentials are partially configured; configure all three values or remove all three'
+              exit 1
+              ;;
+          esac
+
   sync-to-r2:
     name: Verify and mirror immutable release
+    needs: r2-credentials
+    if: needs.r2-credentials.outputs.configured == 'true'
     runs-on: ubuntu-22.04
     environment: release
     steps:
@@ -107,18 +153,6 @@ jobs:
             echo "::error::$TAG is not the expected immutable stable release bound to the verified tag"; exit 1;
           }
           printf 'release_id=%s\npublished_at=%s\n' "$release_id" "$(printf '%s' "$release" | jq -r .published_at)" >> "$GITHUB_OUTPUT"
-
-      - name: Require complete R2 credentials
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          [ -n "$R2_ACCOUNT_ID" ] && [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] || {
-            echo "::error::R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY must all be configured"
-            exit 1
-          }
 
       - name: Checkout current protected verification tooling
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
