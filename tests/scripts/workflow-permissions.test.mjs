@@ -6,6 +6,11 @@ import { describe, expect, it } from "vitest";
 const readWorkflow = (name) =>
   fs.readFileSync(path.resolve(".github/workflows", name), "utf8");
 
+const expectedR2Permissions = Object.freeze({
+  actions: "read",
+  contents: "read",
+});
+
 function parseWorkflow(name) {
   const workflow = parse(readWorkflow(name));
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
@@ -47,9 +52,16 @@ function validateReusablePermissionContract(caller, callee) {
     }
   }
 
-  if (JSON.stringify(callerPermissions) !== JSON.stringify(calleePermissions)) {
+  const expectedPermissions = normalizePermissions(
+    expectedR2Permissions,
+    "expected sync-r2 permissions",
+  );
+  if (
+    JSON.stringify(callerPermissions) !== JSON.stringify(expectedPermissions) ||
+    JSON.stringify(calleePermissions) !== JSON.stringify(expectedPermissions)
+  ) {
     throw new Error(
-      "sync-r2 caller and callee must declare the same permission map",
+      "sync-r2 caller and callee must declare exactly the required read permissions",
     );
   }
 }
@@ -62,7 +74,7 @@ function loadProductionWorkflows() {
 }
 
 describe("reusable release workflow permissions", () => {
-  it("grants exactly the read permissions requested by the R2 callee", () => {
+  it("grants exactly the required read permissions to caller and callee", () => {
     const { caller, callee } = loadProductionWorkflows();
 
     expect(() =>
@@ -83,12 +95,22 @@ describe("reusable release workflow permissions", () => {
     ).not.toThrow();
   });
 
-  it("rejects a new callee permission until the caller grants it", () => {
+  it("rejects a new permission in only the callee", () => {
     const { caller, callee } = loadProductionWorkflows();
     callee.permissions.checks = "read";
 
     expect(() => validateReusablePermissionContract(caller, callee)).toThrow(
-      "same permission map",
+      "exactly the required read permissions",
+    );
+  });
+
+  it("rejects the same unnecessary read permission in caller and callee", () => {
+    const { caller, callee } = loadProductionWorkflows();
+    caller.jobs["sync-r2"].permissions.checks = "read";
+    callee.permissions.checks = "read";
+
+    expect(() => validateReusablePermissionContract(caller, callee)).toThrow(
+      "exactly the required read permissions",
     );
   });
 
@@ -97,7 +119,7 @@ describe("reusable release workflow permissions", () => {
     delete caller.jobs["sync-r2"].permissions.actions;
 
     expect(() => validateReusablePermissionContract(caller, callee)).toThrow(
-      "same permission map",
+      "exactly the required read permissions",
     );
   });
 
