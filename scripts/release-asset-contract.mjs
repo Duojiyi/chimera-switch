@@ -1,8 +1,12 @@
 export const releaseTagPattern = /^v\d+\.\d+\.\d+$/;
+export const gitCommitShaPattern = /^[0-9a-f]{40}$/;
+export const sha256DigestPattern = /^[0-9a-f]{64}$/;
 
 export function getReleaseAssetContract(tag) {
   if (!releaseTagPattern.test(tag ?? "")) {
-    throw new Error(`release tag must match vX.Y.Z (received: ${tag ?? "empty"})`);
+    throw new Error(
+      `release tag must match vX.Y.Z (received: ${tag ?? "empty"})`,
+    );
   }
 
   const updater = {
@@ -33,12 +37,15 @@ export function getReleaseAssetContract(tag) {
   ];
   const signableAssets = [...requiredUpdater, ...expectedUserAssets];
   const expectedSignatures = signableAssets.map((name) => `${name}.sig`);
+  const provenanceAssetNames = [
+    ...signableAssets,
+    ...expectedSignatures,
+  ].sort();
   const provenanceName = "provenance.json";
   const provenanceSignatureName = `${provenanceName}.sig`;
   const latestAssetName = "latest.json";
   const publicAssetNames = [
-    ...signableAssets,
-    ...expectedSignatures,
+    ...provenanceAssetNames,
     provenanceName,
     provenanceSignatureName,
     latestAssetName,
@@ -52,6 +59,7 @@ export function getReleaseAssetContract(tag) {
     mandatoryUserAssets: expectedUserAssets,
     signableAssets,
     expectedSignatures,
+    provenanceAssetNames,
     provenanceName,
     provenanceSignatureName,
     latestAssetName,

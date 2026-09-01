@@ -920,8 +920,14 @@ jobs:
           import { createHash } from "node:crypto";
           import { readdirSync, readFileSync, writeFileSync } from "node:fs";
           import { join } from "node:path";
+          import { getReleaseAssetContract } from "./scripts/release-asset-contract.mjs";
           const dir = "release-assets";
-          const assets = Object.fromEntries(readdirSync(dir).filter((name) => name !== "provenance.json").sort().map((name) => [name, createHash("sha256").update(readFileSync(join(dir, name))).digest("hex")]));
+          const { provenanceAssetNames, provenanceName, provenanceSignatureName, latestAssetName } = getReleaseAssetContract(process.env.RELEASE_TAG);
+          const actualNames = readdirSync(dir).filter((name) => name !== provenanceName && name !== provenanceSignatureName && name !== latestAssetName).sort();
+          if (actualNames.length !== provenanceAssetNames.length || actualNames.some((name, index) => name !== provenanceAssetNames[index])) {
+            throw new Error("Signed asset set does not match the provenance contract");
+          }
+          const assets = Object.fromEntries(provenanceAssetNames.map((name) => [name, createHash("sha256").update(readFileSync(join(dir, name))).digest("hex")]));
           const provenance = {
             schemaVersion: 1,
             repository: process.env.GITHUB_REPOSITORY,
