@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { parse } from "yaml";
@@ -30,12 +31,163 @@ const expectedPromotionPermissions = Object.freeze({
 
 const approvedWriterJobs = new Set(["stage-draft", "promote-stable"]);
 
+const expectedWriterStepDigests = Object.freeze({
+  "stage-draft": Object.freeze([
+    "3f6ce2d9b6f1757de086f30b500ef8f4da53023bf05ea0728fadc5c3d17863ad",
+    "8aa28dc9e5885ffd483c5f90f32ad7b32b9fd61dd8ba32748d2a7b919468a2a1",
+  ]),
+  "promote-stable": Object.freeze([
+    "3f86b3e05261dcf090647505a35ba0995c642a1bb7e4c4d0f372f9a7f0f21f45",
+    "2d55e0b4f9274a9dbc788b35a5886754ce2b758242d106bc6b6dfc9f7e2fead2",
+    "2268e0796958a4788a4d6b9f2d19a837d2b9903b4f1ba90762860e680f86669b",
+  ]),
+});
+
+const stageOutputs = Object.freeze({
+  release_id: "${{ steps.stage.outputs.release_id }}",
+  source_sha: "${{ steps.stage.outputs.source_sha }}",
+  verification_tooling_sha:
+    "${{ steps.stage.outputs.verification_tooling_sha }}",
+  release_phase: "${{ steps.stage.outputs.release_phase }}",
+  artifact_name: "${{ steps.stage.outputs.artifact_name }}",
+});
+
+const expectedPromotionGraph = Object.freeze({
+  request: Object.freeze({
+    needs: null,
+    if: null,
+    outputs: Object.freeze({
+      tag: "${{ steps.request.outputs.tag }}",
+      request_id: "${{ steps.request.outputs.request_id }}",
+      mode: "${{ steps.request.outputs.mode }}",
+    }),
+  }),
+  "stage-draft": Object.freeze({
+    needs: "request",
+    if: "needs.request.outputs.mode == 'promote'",
+    outputs: stageOutputs,
+  }),
+  "stage-stable": Object.freeze({
+    needs: "request",
+    if: "needs.request.outputs.mode == 'repair'",
+    outputs: stageOutputs,
+  }),
+  "verify-release": Object.freeze({
+    needs: Object.freeze(["request", "stage-draft", "stage-stable"]),
+    if: "always() && needs.request.result == 'success' && ((needs.request.outputs.mode == 'promote' && needs.stage-draft.result == 'success') || (needs.request.outputs.mode == 'repair' && needs.stage-stable.result == 'success'))",
+    outputs: Object.freeze({
+      tag: "${{ needs.request.outputs.tag }}",
+      request_id: "${{ needs.request.outputs.request_id }}",
+      mode: "${{ needs.request.outputs.mode }}",
+      release_id: "${{ steps.verify.outputs.release_id }}",
+      source_sha: "${{ steps.verify.outputs.source_sha }}",
+      release_tooling_sha: "${{ steps.verify.outputs.release_tooling_sha }}",
+      verification_tooling_sha:
+        "${{ steps.verify.outputs.verification_tooling_sha }}",
+      workflow_run_id: "${{ steps.verify.outputs.workflow_run_id }}",
+      workflow_run_attempt: "${{ steps.verify.outputs.workflow_run_attempt }}",
+      asset_snapshot_sha256:
+        "${{ steps.verify.outputs.asset_snapshot_sha256 }}",
+      release_phase: "${{ steps.verify.outputs.release_phase }}",
+    }),
+  }),
+  "promote-stable": Object.freeze({
+    needs: Object.freeze(["verify-release"]),
+    if: "needs.verify-release.outputs.mode == 'promote'",
+    outputs: Object.freeze({}),
+  }),
+  "authorize-repair": Object.freeze({
+    needs: Object.freeze(["verify-release"]),
+    if: "needs.verify-release.outputs.mode == 'repair'",
+    outputs: Object.freeze({}),
+  }),
+  "verify-published": Object.freeze({
+    needs: Object.freeze([
+      "verify-release",
+      "promote-stable",
+      "authorize-repair",
+    ]),
+    if: "always() && needs.verify-release.result == 'success' && ((needs.verify-release.outputs.mode == 'promote' && needs.promote-stable.result == 'success') || (needs.verify-release.outputs.mode == 'repair' && needs.authorize-repair.result == 'success'))",
+    outputs: Object.freeze({}),
+  }),
+  "sync-r2": Object.freeze({
+    needs: Object.freeze([
+      "verify-release",
+      "promote-stable",
+      "authorize-repair",
+      "verify-published",
+    ]),
+    if: "always() && needs.verify-published.result == 'success'",
+    outputs: Object.freeze({}),
+    with: Object.freeze({
+      tag: "${{ needs.verify-release.outputs.tag }}",
+      request_id: "${{ needs.verify-release.outputs.request_id }}",
+      source_sha: "${{ needs.verify-release.outputs.source_sha }}",
+      release_tooling_sha:
+        "${{ needs.verify-release.outputs.release_tooling_sha }}",
+      verification_tooling_sha:
+        "${{ needs.verify-release.outputs.verification_tooling_sha }}",
+      require_r2: "${{ needs.verify-release.outputs.mode == 'repair' }}",
+    }),
+  }),
+});
+
 function parseWorkflow(name) {
   const workflow = parse(readWorkflow(name));
   if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
     throw new TypeError(`${name} must contain a YAML mapping`);
   }
   return workflow;
+}
+
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, nested]) => [key, canonicalize(nested)]),
+    );
+  }
+  return value;
+}
+
+function hashConfiguration(value) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalize(value)))
+    .digest("hex");
+}
+
+function validateWriterStepDigests(workflow) {
+  for (const [jobName, expected] of Object.entries(expectedWriterStepDigests)) {
+    const actual = getSteps(workflow.jobs?.[jobName], jobName).map(
+      hashConfiguration,
+    );
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error(
+        `${jobName} step definitions must match the reviewed SHA-256 allowlist`,
+      );
+    }
+  }
+}
+
+function validateTaskGraph(workflow) {
+  for (const [jobName, expected] of Object.entries(expectedPromotionGraph)) {
+    const job = workflow.jobs?.[jobName];
+    if (!job) throw new Error(`missing promotion job: ${jobName}`);
+    const actual = {
+      needs: job.needs ?? null,
+      if: job.if ?? null,
+      outputs: job.outputs ?? {},
+    };
+    if (Object.hasOwn(expected, "with")) actual.with = job.with ?? {};
+    if (
+      JSON.stringify(canonicalize(actual)) !==
+      JSON.stringify(canonicalize(expected))
+    ) {
+      throw new Error(`${jobName} task graph or output wiring changed`);
+    }
+  }
 }
 
 function normalizePermissions(value, label) {
@@ -108,12 +260,20 @@ function validateStagingJob(job, name, expectedFirstStep) {
   if (upload.uses !== uploadArtifactAction || upload.run !== undefined) {
     throw new Error(`${name} may only use the pinned artifact uploader`);
   }
+  const expectedUpload = {
+    name: "${{ steps.stage.outputs.artifact_name }}",
+    path: "promotion-stage",
+    "if-no-files-found": "error",
+    "retention-days": 1,
+    "compression-level": 0,
+  };
   if (
-    upload.with?.["if-no-files-found"] !== "error" ||
-    upload.with?.["retention-days"] !== 1 ||
-    upload.with?.["compression-level"] !== 0
+    JSON.stringify(canonicalize(upload.with)) !==
+    JSON.stringify(canonicalize(expectedUpload))
   ) {
-    throw new Error(`${name} artifact settings must remain fail-closed`);
+    throw new Error(
+      `${name} artifact settings must remain exactly allowlisted`,
+    );
   }
 
   const script = stage.run;
@@ -122,7 +282,7 @@ function validateStagingJob(job, name, expectedFirstStep) {
     /\b(?:curl|wget|bash|sh|python\d*|perl|ruby|node|deno|npm|npx|pnpm)\b/i,
     /\bgh\s+release\b/i,
     /\bgh\s+api\s+graphql\b/i,
-    /\bgh\s+api\b[^\n]*(?:--method|\s-X|--input)\b/i,
+    /\bgh\s+api\b[^\n]*(?:--method(?:\s|=)|\s-X|--input(?:\s|=))/i,
     /\bgh\s+api\b[^\n]*(?:\s-[fF]|--field|--raw-field)(?:\s|=)/i,
     /\bgit\s+(?:push|tag|commit)\b/i,
     /\bscripts\//i,
@@ -167,7 +327,8 @@ function validatePublisherJob(job) {
   }
 
   const script = job.steps.map((step) => step.run ?? "").join("\n");
-  const patchMatches = script.match(
+  const normalizedScript = script.replace(/\\\r?\n\s*/g, " ");
+  const patchMatches = normalizedScript.match(
     /gh api --method PATCH "repos\/\$REPOSITORY\/releases\/\$RELEASE_ID"/g,
   );
   if (patchMatches?.length !== 1) {
@@ -175,17 +336,27 @@ function validatePublisherJob(job) {
       "promote-stable must contain exactly one approved Release PATCH",
     );
   }
-  const methodMatches =
-    script.match(/\bgh\s+api\b[^\n]*(?:--method|-X)\s+\w+/gi) ?? [];
-  if (methodMatches.length !== 1 || !/--method PATCH/i.test(methodMatches[0])) {
+  const explicitMethods = [
+    ...normalizedScript.matchAll(
+      /(?:--method(?:\s+|=)|(?:^|\s)-X(?:\s+|=)?)([A-Za-z]+)/gim,
+    ),
+  ].map((match) => match[1].toUpperCase());
+  if (explicitMethods.length !== 1 || explicitMethods[0] !== "PATCH") {
     throw new Error(
       "promote-stable contains an unapproved explicit API method",
     );
   }
-  if (/\bgh\s+api\s+graphql\b|\b(?:curl|wget)\b|\bgit\s+push\b/i.test(script)) {
+  if (
+    /\bgh\s+api\s+graphql\b|\bgh\s+release\b|\b(?:curl|wget)\b|\bgit\s+push\b/i.test(
+      normalizedScript,
+    )
+  ) {
     throw new Error("promote-stable contains an unapproved mutation channel");
   }
-  const formFlags = script.match(/\s-[fF](?:\s|=)/g) ?? [];
+  if (/--input(?:\s|=)|--(?:raw-)?field(?:\s|=)/i.test(normalizedScript)) {
+    throw new Error("promote-stable contains an unapproved API input channel");
+  }
+  const formFlags = normalizedScript.match(/\s-[fF](?=\s|=|[A-Za-z_])/g) ?? [];
   if (formFlags.length !== 3) {
     throw new Error(
       "promote-stable form fields must be confined to the Release PATCH",
@@ -268,6 +439,8 @@ function validatePromotionPermissionContract(workflow) {
     }
   }
 
+  validateTaskGraph(workflow);
+
   const draft = workflow.jobs?.["stage-draft"];
   const stable = workflow.jobs?.["stage-stable"];
   const publisher = workflow.jobs?.["promote-stable"];
@@ -288,6 +461,7 @@ function validatePromotionPermissionContract(workflow) {
   );
   validateStagingJob(stable, "stage-stable", "Stage immutable stable release");
   validatePublisherJob(publisher);
+  validateWriterStepDigests(workflow);
   validateAllCheckouts(workflow);
 
   if (
@@ -302,6 +476,7 @@ function loadProductionWorkflows() {
   return {
     caller: parseWorkflow("promote-release.yml"),
     callee: parseWorkflow("sync-r2.yml"),
+    upstream: parseWorkflow("sync-upstream.yml"),
   };
 }
 
@@ -346,6 +521,8 @@ describe("release promotion permissions", () => {
 
   it.each([
     'gh api "repos/example/releases" -f tag_name=v1.2.3',
+    'gh api --method=POST "repos/example/releases"',
+    'gh api -XDELETE "repos/example/releases/1"',
     'gh api graphql -f query="mutation { deleteRef(input: {}) }"',
     'curl -X DELETE -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/example/releases/1',
   ])("rejects a staging mutation channel: %s", (command) => {
@@ -355,6 +532,65 @@ describe("release promotion permissions", () => {
       "stage-draft must remain a fixed read-only staging reader",
     );
   });
+
+  it.each([
+    [
+      'gh api --method=DELETE "repos/$REPOSITORY/releases/$RELEASE_ID"',
+      "unapproved explicit API method",
+    ],
+    [
+      'gh api -XDELETE "repos/$REPOSITORY/releases/$RELEASE_ID"',
+      "unapproved explicit API method",
+    ],
+    ['gh release delete "$TAG" --yes', "unapproved mutation channel"],
+    ['gh release edit "$TAG" --draft=false', "unapproved mutation channel"],
+    ['gh release upload "$TAG" unexpected.bin', "unapproved mutation channel"],
+  ])("rejects a publisher mutation channel: %s", (command, message) => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["promote-stable"].steps[2].run += `\n${command}`;
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(message);
+  });
+
+  it.each([
+    ["name", "unexpected-artifact"],
+    ["path", "."],
+  ])("rejects changing the isolated uploader %s", (key, value) => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs["stage-draft"].steps[1].with[key] = value;
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "stage-draft artifact settings must remain exactly allowlisted",
+    );
+  });
+
+  it.each([
+    ["verify-release", "release_id", "${{ steps.verify.outputs.source_sha }}"],
+    [
+      "verify-release",
+      "workflow_run_attempt",
+      "${{ steps.verify.outputs.workflow_run_id }}",
+    ],
+    ["stage-draft", "artifact_name", "${{ steps.stage.outputs.release_id }}"],
+  ])("rejects changing %s output %s", (jobName, outputName, value) => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs[jobName].outputs[outputName] = value;
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      `${jobName} task graph or output wiring changed`,
+    );
+  });
+
+  it.each(["verify-release", "verify-published"])(
+    "rejects removing always() from %s",
+    (jobName) => {
+      const { caller } = loadProductionWorkflows();
+      caller.jobs[jobName].if = caller.jobs[jobName].if.replace(
+        "always() && ",
+        "",
+      );
+      expect(() => validatePromotionPermissionContract(caller)).toThrow(
+        `${jobName} task graph or output wiring changed`,
+      );
+    },
+  );
 
   it("rejects an extra checkout even when its credentials setting looks safe", () => {
     const { caller } = loadProductionWorkflows();
@@ -417,6 +653,105 @@ describe("release promotion state machine", () => {
     );
   });
 
+  it("enforces the fixed 29-file contract and byte limits before staging downloads", () => {
+    const { caller } = loadProductionWorkflows();
+    const suffixes = [
+      "Linux-arm64.AppImage",
+      "Linux-arm64.deb",
+      "Linux-arm64.rpm",
+      "Linux-x86_64.AppImage",
+      "Linux-x86_64.deb",
+      "Linux-x86_64.rpm",
+      "macOS.dmg",
+      "macOS.tar.gz",
+      "macOS.zip",
+      "Windows-arm64-Portable.zip",
+      "Windows-arm64.msi",
+      "Windows-Portable.zip",
+      "Windows.msi",
+    ];
+    for (const [jobName, stepName] of [
+      ["stage-draft", "Stage draft or previously published release"],
+      ["stage-stable", "Stage immutable stable release"],
+    ]) {
+      const staging = getRun(caller.jobs[jobName], stepName);
+      const contract = staging.indexOf("expected_assets=()");
+      const download = staging.indexOf(
+        "while IFS=$'\\t' read -r asset_id name",
+      );
+      expect(contract).toBeGreaterThanOrEqual(0);
+      expect(download).toBeGreaterThan(contract);
+      for (const suffix of suffixes) expect(staging).toContain(suffix);
+      expect(staging).toContain(
+        "expected_assets+=(latest.json provenance.json provenance.json.sig)",
+      );
+      expect(staging).toContain("fixed 29-file publication contract");
+      expect(staging).toContain(".size <= 268435456");
+      expect(staging).toContain("add <= 1073741824");
+    }
+  });
+
+  it("binds provenance and CI verification to the signed run attempt", () => {
+    const { caller, callee, upstream } = loadProductionWorkflows();
+    const promotionVerify = getRun(
+      caller.jobs["verify-release"],
+      "Verify signed provenance without write credentials",
+    );
+    const r2Verify = getRun(
+      callee.jobs["sync-to-r2"],
+      "Download exact stable assets and verify historical provenance",
+    );
+    const upstreamPublish = getRun(
+      upstream.jobs.publish,
+      "Push candidate and create protected sync PR",
+    );
+    expect(promotionVerify).toContain(
+      'run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")',
+    );
+    expect(r2Verify).toContain(
+      'run_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")',
+    );
+    expect(upstreamPublish).toContain(
+      'final_ci_run=$(gh api "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt")',
+    );
+  });
+
+  it("keeps the final Release GET immediately before local checks and the sole PATCH", () => {
+    const { caller } = loadProductionWorkflows();
+    const publishing = getRun(
+      caller.jobs["promote-stable"],
+      "Commit verified release state idempotently",
+    );
+    const mainCheck = publishing.lastIndexOf("refs/heads/main");
+    const tagCheck = publishing.lastIndexOf('"refs/tags/$TAG^{}"');
+    const releaseGet = publishing.indexOf(
+      'release=$(gh api "repos/$REPOSITORY/releases/$RELEASE_ID")',
+    );
+    const patch = publishing.indexOf("gh api --method PATCH");
+    expect(mainCheck).toBeGreaterThanOrEqual(0);
+    expect(tagCheck).toBeGreaterThan(mainCheck);
+    expect(releaseGet).toBeGreaterThan(tagCheck);
+    expect(patch).toBeGreaterThan(releaseGet);
+    const afterGetLine = publishing.indexOf("\n", releaseGet);
+    expect(publishing.slice(afterGetLine, patch)).not.toMatch(/\b(?:gh|git)\s/);
+  });
+
+  it("rechecks protected main and the immutable tag after publication", () => {
+    const { caller } = loadProductionWorkflows();
+    const verification = getRun(
+      caller.jobs["verify-published"],
+      "Re-download and verify immutable public release",
+    );
+    const mainCheck = verification.indexOf("refs/heads/main");
+    const tagCheck = verification.indexOf('"refs/tags/$TAG^{}"');
+    expect(mainCheck).toBeGreaterThanOrEqual(0);
+    expect(tagCheck).toBeGreaterThan(mainCheck);
+    expect(verification).toContain(
+      '[ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ]',
+    );
+    expect(verification).toContain('[ "$remote_sha" = "$SOURCE_SHA" ]');
+  });
+
   it("moves fallible attestation checks after the retryable commit point", () => {
     const { caller } = loadProductionWorkflows();
     const publisher = caller.jobs["promote-stable"];
@@ -443,6 +778,12 @@ describe("release promotion state machine", () => {
     expect(mirror).toContain("mirror synchronization will be skipped");
     expect(mirror).toContain("3)");
     expect(mirror).toContain("partially configured");
+    expect(caller.jobs["promote-stable"].steps[0].if).toBe(
+      "needs.verify-release.outputs.release_phase == 'draft'",
+    );
+    expect(caller.jobs["promote-stable"].steps[1].if).toBe(
+      "needs.verify-release.outputs.release_phase == 'draft'",
+    );
     expect(caller.jobs["sync-r2"].with.require_r2).toBe(
       "${{ needs.verify-release.outputs.mode == 'repair' }}",
     );

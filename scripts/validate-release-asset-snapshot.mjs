@@ -17,6 +17,15 @@ if (!snapshotPath || !releaseTagPattern.test(tag ?? "")) {
   process.exit(1);
 }
 
+const maxAssetBytes = 256 * 1024 * 1024;
+const maxReleaseBytes = 1024 * 1024 * 1024;
+
+async function sha256File(file) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
 const failures = [];
 let snapshot;
 try {
@@ -33,6 +42,7 @@ const { publicAssetNames } = getReleaseAssetContract(tag);
 const expectedKeys = ["digest", "id", "name", "size", "state"];
 const names = [];
 const ids = new Set();
+let totalSize = 0;
 for (const [index, asset] of snapshot.entries()) {
   const label = `${snapshotPath}[${index}]`;
   if (!asset || typeof asset !== "object" || Array.isArray(asset)) {
@@ -57,6 +67,11 @@ for (const [index, asset] of snapshot.entries()) {
   }
   if (!Number.isSafeInteger(asset.size) || asset.size <= 0) {
     failures.push(`${label}: size must be a positive safe integer`);
+  } else {
+    totalSize += asset.size;
+    if (asset.size > maxAssetBytes) {
+      failures.push(`${label}: size exceeds the 256 MiB per-file limit`);
+    }
   }
   if (typeof asset.digest !== "string" || !/^sha256:[0-9a-f]{64}$/.test(asset.digest)) {
     failures.push(`${label}: digest must be sha256:<64 lowercase hex>`);
@@ -66,6 +81,7 @@ for (const [index, asset] of snapshot.entries()) {
   }
 }
 
+if (totalSize > maxReleaseBytes) failures.push(`${snapshotPath}: total asset size exceeds the 1 GiB release limit`);
 if (names.length !== new Set(names).size) failures.push(`${snapshotPath}: asset names are not unique`);
 if (names.length !== publicAssetNames.length || names.some((name, index) => name !== publicAssetNames[index])) {
   failures.push(`${snapshotPath}: assets must be exactly the ${publicAssetNames.length} contract names in lexical order`);
@@ -94,7 +110,7 @@ if (assetsDir) {
       const stat = fs.statSync(file);
       if (!stat.isFile()) throw new Error("not a regular file");
       if (stat.size !== asset.size) failures.push(`${asset.name}: downloaded size ${stat.size} differs from API size ${asset.size}`);
-      const digest = `sha256:${crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")}`;
+      const digest = `sha256:${await sha256File(file)}`;
       if (digest !== asset.digest) failures.push(`${asset.name}: downloaded SHA-256 differs from API digest`);
     } catch (error) {
       failures.push(`${asset.name}: could not verify downloaded file (${error.message})`);

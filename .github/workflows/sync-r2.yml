@@ -194,7 +194,7 @@ jobs:
           workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' r2-assets/provenance.json)
           printf '%s' "$workflow_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run id"; exit 1; }
           printf '%s' "$workflow_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run attempt"; exit 1; }
-          run_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id")
+          run_info=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")
           printf '%s' "$run_info" | jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$RELEASE_TOOLING_SHA" --argjson attempt "$workflow_run_attempt" '
             .path == ".github/workflows/release.yml"
             and (.event == "workflow_dispatch" or .event == "repository_dispatch")

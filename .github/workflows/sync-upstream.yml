@@ -570,7 +570,7 @@ jobs:
           [ "$(printf '%s' "$pr_data" | jq -r .baseRefName)" = main ] || { echo "::error::PR base branch changed before merge"; exit 1; }
           [ "$(printf '%s' "$pr_data" | jq -r .baseRefOid)" = "$BASE_SHA" ] || { echo "::error::PR base SHA changed before merge"; exit 1; }
 
-          final_ci_run=$(gh api "repos/$REPOSITORY/actions/runs/$ci_run_id")
+          final_ci_run=$(gh api "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt")
           printf '%s' "$final_ci_run" | jq -e \
             --arg repo "$REPOSITORY" \
             --arg api_repo "$api_repository" \

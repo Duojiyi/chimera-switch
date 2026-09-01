@@ -158,6 +158,38 @@ jobs:
             and ((map(.id) | length) == (map(.id) | unique | length))
             and ((map(.name) | length) == (map(.name) | unique | length))
           ' promotion-stage/release-asset-snapshot.json >/dev/null || { echo "::error::Release asset metadata is unsafe or incomplete"; exit 1; }
+          expected_assets=()
+          for suffix in \
+            Linux-arm64.AppImage \
+            Linux-arm64.deb \
+            Linux-arm64.rpm \
+            Linux-x86_64.AppImage \
+            Linux-x86_64.deb \
+            Linux-x86_64.rpm \
+            macOS.dmg \
+            macOS.tar.gz \
+            macOS.zip \
+            Windows-arm64-Portable.zip \
+            Windows-arm64.msi \
+            Windows-Portable.zip \
+            Windows.msi
+          do
+            expected_assets+=("Chimera-Switch-$TAG-$suffix" "Chimera-Switch-$TAG-$suffix.sig")
+          done
+          expected_assets+=(latest.json provenance.json provenance.json.sig)
+          printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort > expected-assets.txt
+          jq -r '.[].name' promotion-stage/release-asset-snapshot.json | LC_ALL=C sort > actual-assets.txt
+          cmp -s expected-assets.txt actual-assets.txt || {
+            echo "::error::Release assets do not match the fixed 29-file publication contract"
+            diff -u expected-assets.txt actual-assets.txt || true
+            exit 1
+          }
+          rm -f expected-assets.txt actual-assets.txt
+          jq -e 'all(.[]; .size <= 268435456) and ([.[].size] | add <= 1073741824)' \
+            promotion-stage/release-asset-snapshot.json >/dev/null || {
+              echo "::error::Release assets exceed the 256 MiB per-file or 1 GiB total staging limits"
+              exit 1
+            }
           while IFS=$'\t' read -r asset_id name; do
             gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "promotion-stage/release-assets/$name"
             [ -s "promotion-stage/release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
@@ -266,6 +298,38 @@ jobs:
             and ((map(.id) | length) == (map(.id) | unique | length))
             and ((map(.name) | length) == (map(.name) | unique | length))
           ' promotion-stage/release-asset-snapshot.json >/dev/null || { echo "::error::Release asset metadata is unsafe or incomplete"; exit 1; }
+          expected_assets=()
+          for suffix in \
+            Linux-arm64.AppImage \
+            Linux-arm64.deb \
+            Linux-arm64.rpm \
+            Linux-x86_64.AppImage \
+            Linux-x86_64.deb \
+            Linux-x86_64.rpm \
+            macOS.dmg \
+            macOS.tar.gz \
+            macOS.zip \
+            Windows-arm64-Portable.zip \
+            Windows-arm64.msi \
+            Windows-Portable.zip \
+            Windows.msi
+          do
+            expected_assets+=("Chimera-Switch-$TAG-$suffix" "Chimera-Switch-$TAG-$suffix.sig")
+          done
+          expected_assets+=(latest.json provenance.json provenance.json.sig)
+          printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort > expected-assets.txt
+          jq -r '.[].name' promotion-stage/release-asset-snapshot.json | LC_ALL=C sort > actual-assets.txt
+          cmp -s expected-assets.txt actual-assets.txt || {
+            echo "::error::Release assets do not match the fixed 29-file publication contract"
+            diff -u expected-assets.txt actual-assets.txt || true
+            exit 1
+          }
+          rm -f expected-assets.txt actual-assets.txt
+          jq -e 'all(.[]; .size <= 268435456) and ([.[].size] | add <= 1073741824)' \
+            promotion-stage/release-asset-snapshot.json >/dev/null || {
+              echo "::error::Release assets exceed the 256 MiB per-file or 1 GiB total staging limits"
+              exit 1
+            }
           while IFS=$'\t' read -r asset_id name; do
             gh api -H 'Accept: application/octet-stream' "repos/$REPOSITORY/releases/assets/$asset_id" > "promotion-stage/release-assets/$name"
             [ -s "promotion-stage/release-assets/$name" ] || { echo "::error::Empty release asset: $name"; exit 1; }
@@ -393,7 +457,7 @@ jobs:
             ahead|identical) ;;
             *) echo "::error::Historical release tooling is not an ancestor of protected verification tooling ($comparison)"; exit 1 ;;
           esac
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id")
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")
           printf '%s' "$run_info" | jq -e --arg repo "$REPOSITORY" --arg sha "$release_tooling_sha" --argjson attempt "$workflow_run_attempt" '
             .path == ".github/workflows/release.yml"
             and (.event == "workflow_dispatch" or .event == "repository_dispatch")
@@ -414,6 +478,7 @@ jobs:
       contents: write
     steps:
       - name: Require immutable releases
+        if: needs.verify-release.outputs.release_phase == 'draft'
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
@@ -426,6 +491,7 @@ jobs:
           [ "$enabled" = true ] || { echo "::error::Repository immutable releases must be enabled before stable publication"; exit 1; }
 
       - name: Validate optional mirror configuration before publication
+        if: needs.verify-release.outputs.release_phase == 'draft'
         env:
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -459,6 +525,13 @@ jobs:
         run: |
           set -euo pipefail
           printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release id before publication"; exit 1; }
+
+          # Resolve protected main and the tag immediately before the final Release read.
+          # GitHub's Releases API rejects conditional PATCHes against its weak ETag,
+          # so the final validated GET below is deliberately the last network read.
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not re-resolve protected main"; exit 1; }
+          [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || { echo "::error::Protected main moved before publication ($main_sha != $VERIFICATION_TOOLING_SHA); rerun from the new tip"; exit 1; }
           refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
           remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
           [ -n "$remote_sha" ] || remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
@@ -487,10 +560,7 @@ jobs:
             exit 1
           fi
 
-          # This is the final check before the only irreversible GitHub write.
-          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
-          printf '%s' "$main_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not re-resolve protected main"; exit 1; }
-          [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || { echo "::error::Protected main moved before publication ($main_sha != $VERIFICATION_TOOLING_SHA); rerun from the new tip"; exit 1; }
+          # Local checks only between the final Release GET and the sole write.
           if [ "$release_phase" = draft ]; then
             gh api --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
               -F draft=false -F prerelease=false -f make_latest=true >/dev/null
@@ -549,6 +619,7 @@ jobs:
           RELEASE_ID: ${{ needs.verify-release.outputs.release_id }}
           SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
           RELEASE_TOOLING_SHA: ${{ needs.verify-release.outputs.release_tooling_sha }}
+          VERIFICATION_TOOLING_SHA: ${{ needs.verify-release.outputs.verification_tooling_sha }}
           WORKFLOW_RUN_ID: ${{ needs.verify-release.outputs.workflow_run_id }}
           WORKFLOW_RUN_ATTEMPT: ${{ needs.verify-release.outputs.workflow_run_attempt }}
           SNAPSHOT_SHA256: ${{ needs.verify-release.outputs.asset_snapshot_sha256 }}
@@ -572,6 +643,14 @@ jobs:
             sleep 3
           done
           [ "$verified_state" = true ] || { echo "::error::Release did not reach the expected immutable stable state"; exit 1; }
+
+          main_sha=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          [ "$main_sha" = "$VERIFICATION_TOOLING_SHA" ] || { echo "::error::Protected main changed after publication; rerun verification from the new tip"; exit 1; }
+          refs=$(git ls-remote --exit-code "https://github.com/$REPOSITORY.git" "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          remote_sha=$(printf '%s\n' "$refs" | awk '$2 == "refs/tags/'"$TAG"'^{}" {print $1; exit}')
+          [ -n "$remote_sha" ] || remote_sha=$(printf '%s\n' "$refs" | awk 'NR == 1 {print $1}')
+          [ "$remote_sha" = "$SOURCE_SHA" ] || { echo "::error::Tag changed after publication"; exit 1; }
+
           printf '%s' "$release" | jq '[.assets[] | {name,id,size,digest,state}] | sort_by(.name)' > published-snapshot.json
           node scripts/validate-release-asset-snapshot.mjs published-snapshot.json "$TAG"
           [ "$(sha256sum published-snapshot.json | awk '{print $1}')" = "$SNAPSHOT_SHA256" ] || { echo "::error::Published immutable asset snapshot differs from the verified candidate"; exit 1; }
