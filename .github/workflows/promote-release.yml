@@ -416,6 +416,9 @@ jobs:
       && needs.authorize-repair.result == 'success')
       || (needs.resolve-release.outputs.mode == 'promote'
       && needs.promote-stable.result == 'success'))
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/sync-r2.yml
     with:
       tag: ${{ needs.resolve-release.outputs.tag }}
