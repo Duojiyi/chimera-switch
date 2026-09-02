@@ -99,12 +99,12 @@ const expectedPromotionGraph = Object.freeze({
   }),
   "promote-stable": Object.freeze({
     needs: Object.freeze(["verify-release"]),
-    if: "needs.verify-release.outputs.mode == 'promote'",
+    if: "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'",
     outputs: Object.freeze({}),
   }),
   "authorize-repair": Object.freeze({
     needs: Object.freeze(["verify-release"]),
-    if: "needs.verify-release.outputs.mode == 'repair'",
+    if: "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'",
     outputs: Object.freeze({}),
   }),
   "verify-published": Object.freeze({
@@ -531,14 +531,24 @@ function validatePromotionPermissionContract(workflow) {
   const draft = workflow.jobs?.["stage-draft"];
   const stable = workflow.jobs?.["stage-stable"];
   const publisher = workflow.jobs?.["promote-stable"];
+  const repairAuthorizer = workflow.jobs?.["authorize-repair"];
   if (draft?.if !== "needs.request.outputs.mode == 'promote'") {
     throw new Error("stage-draft must only run in promote mode");
   }
   if (stable?.if !== "needs.request.outputs.mode == 'repair'") {
     throw new Error("stage-stable must only run in repair mode");
   }
-  if (publisher?.if !== "needs.verify-release.outputs.mode == 'promote'") {
-    throw new Error("promote-stable must only run in promote mode");
+  if (
+    publisher?.if !==
+    "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'"
+  ) {
+    throw new Error("promote-stable must require verified promote mode");
+  }
+  if (
+    repairAuthorizer?.if !==
+    "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'"
+  ) {
+    throw new Error("authorize-repair must require verified repair mode");
   }
 
   validateStagingJob(
@@ -669,19 +679,21 @@ describe("release promotion permissions", () => {
     );
   });
 
-  it.each(["verify-release", "verify-published"])(
-    "rejects removing always() from %s",
-    (jobName) => {
-      const { caller } = loadProductionWorkflows();
-      caller.jobs[jobName].if = caller.jobs[jobName].if.replace(
-        "always() && ",
-        "",
-      );
-      expect(() => validatePromotionPermissionContract(caller)).toThrow(
-        `${jobName} task graph or output wiring changed`,
-      );
-    },
-  );
+  it.each([
+    "verify-release",
+    "promote-stable",
+    "authorize-repair",
+    "verify-published",
+  ])("rejects removing always() from %s", (jobName) => {
+    const { caller } = loadProductionWorkflows();
+    caller.jobs[jobName].if = caller.jobs[jobName].if.replace(
+      "always() && ",
+      "",
+    );
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      `${jobName} task graph or output wiring changed`,
+    );
+  });
 
   it("rejects an extra checkout even when its credentials setting looks safe", () => {
     const { caller } = loadProductionWorkflows();
