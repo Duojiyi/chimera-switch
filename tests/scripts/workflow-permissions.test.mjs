@@ -1,5 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { parse } from "yaml";
 import { describe, expect, it } from "vitest";
@@ -32,6 +34,9 @@ const expectedPromotionPermissions = Object.freeze({
 
 const approvedWriterJobs = new Set(["stage-draft", "promote-stable"]);
 
+const expectedPromotionGateStepDigest =
+  "019bb38b84606d6c0b79f33b9547aa68a5261e7102b0015423599faa5bb997fa";
+
 const expectedWriterStepDigests = Object.freeze({
   "stage-draft": Object.freeze([
     "3f6ce2d9b6f1757de086f30b500ef8f4da53023bf05ea0728fadc5c3d17863ad",
@@ -60,7 +65,7 @@ const expectedPromotionGraph = Object.freeze({
     outputs: Object.freeze({
       tag: "${{ steps.request.outputs.tag }}",
       request_id: "${{ steps.request.outputs.request_id }}",
-      mode: "${{ steps.request.outputs.mode }}",
+      mode: "${{ steps.route.outputs.mode }}",
     }),
   }),
   "stage-draft": Object.freeze({
@@ -79,7 +84,7 @@ const expectedPromotionGraph = Object.freeze({
     outputs: Object.freeze({
       tag: "${{ steps.verify.outputs.tag }}",
       request_id: "${{ steps.verify.outputs.request_id }}",
-      mode: "${{ steps.verify.outputs.mode }}",
+      mode: "${{ steps.route.outputs.mode }}",
       release_id: "${{ steps.verify.outputs.release_id }}",
       source_sha: "${{ steps.verify.outputs.source_sha }}",
       release_tooling_sha: "${{ steps.verify.outputs.release_tooling_sha }}",
@@ -171,6 +176,73 @@ function hashConfiguration(value) {
   return createHash("sha256")
     .update(JSON.stringify(canonicalize(value)))
     .digest("hex");
+}
+
+function getBashExecutable() {
+  if (process.platform !== "win32") return "bash";
+  const candidates = [
+    process.env.GIT_BASH,
+    path.join(
+      process.env.ProgramFiles ?? "C:\\Program Files",
+      "Git",
+      "bin",
+      "bash.exe",
+    ),
+    path.join(
+      process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)",
+      "Git",
+      "bin",
+      "bash.exe",
+    ),
+  ].filter(Boolean);
+  const executable = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!executable) {
+    throw new Error("Git Bash is required to execute workflow shell contracts");
+  }
+  return executable;
+}
+
+function toBashPath(file) {
+  if (process.platform !== "win32") return file;
+  return file
+    .replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`)
+    .replaceAll("\\", "/");
+}
+
+function runBashScript(script, environment = {}) {
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "chimera-workflow-contract-"),
+  );
+  const outputPath = path.join(directory, "github-output.txt");
+  try {
+    const result = spawnSync(getBashExecutable(), ["-c", script], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ...environment,
+        GITHUB_OUTPUT: toBashPath(outputPath),
+      },
+    });
+    return {
+      ...result,
+      githubOutput: fs.existsSync(outputPath)
+        ? fs.readFileSync(outputPath, "utf8")
+        : "",
+    };
+  } finally {
+    fs.rmSync(directory, { force: true, recursive: true });
+  }
+}
+
+function validatePromotionGateStepDigest(workflow) {
+  const gate = workflow.jobs?.["promotion-gate"];
+  const actual = hashConfiguration(getSteps(gate, "promotion-gate"));
+  if (actual !== expectedPromotionGateStepDigest) {
+    throw new Error(
+      "promotion-gate step definition must match the reviewed SHA-256 allowlist",
+    );
+  }
 }
 
 function validateWriterStepDigests(workflow) {
@@ -477,6 +549,7 @@ function validatePromotionPermissionContract(workflow) {
   validateStagingJob(stable, "stage-stable", "Stage immutable stable release");
   validatePublisherJob(publisher);
   validateWriterStepDigests(workflow);
+  validatePromotionGateStepDigest(workflow);
   validateAllCheckouts(workflow);
 
   if (
@@ -640,48 +713,192 @@ describe("release promotion permissions", () => {
 });
 
 describe("release promotion routing", () => {
-  it("exports routing fields from the successful verification step", () => {
+  const requestEnvironment = Object.freeze({
+    GITHUB_EVENT_ACTION: "",
+    GITHUB_EVENT_NAME: "workflow_dispatch",
+    GITHUB_REF: "refs/heads/main",
+    GITHUB_RUN_ATTEMPT: "1",
+    GITHUB_RUN_ID: "12345",
+    INPUT_REQUEST_ID: "audit-request-1234",
+    TAG: "v3.20.1",
+  });
+
+  const promoteGateEnvironment = Object.freeze({
+    AUTHORIZE_REPAIR_RESULT: "skipped",
+    PROMOTE_STABLE_RESULT: "success",
+    REQUEST_MODE: "promote",
+    REQUEST_RESULT: "success",
+    STAGE_DRAFT_RESULT: "success",
+    STAGE_STABLE_RESULT: "skipped",
+    SYNC_R2_RESULT: "success",
+    VERIFIED_MODE: "promote",
+    VERIFY_PUBLISHED_RESULT: "success",
+    VERIFY_RELEASE_RESULT: "success",
+  });
+
+  const repairGateEnvironment = Object.freeze({
+    AUTHORIZE_REPAIR_RESULT: "success",
+    PROMOTE_STABLE_RESULT: "skipped",
+    REQUEST_MODE: "repair",
+    REQUEST_RESULT: "success",
+    STAGE_DRAFT_RESULT: "skipped",
+    STAGE_STABLE_RESULT: "success",
+    SYNC_R2_RESULT: "success",
+    VERIFIED_MODE: "repair",
+    VERIFY_PUBLISHED_RESULT: "success",
+    VERIFY_RELEASE_RESULT: "success",
+  });
+
+  it("isolates mode from user-controlled scalar outputs", () => {
+    const { caller } = loadProductionWorkflows();
+    const request = caller.jobs.request;
+    const requestStep = request.steps.find(
+      (step) => step.name === "Validate request and correlation id",
+    );
+    const routeStep = request.steps.find(
+      (step) => step.name === "Resolve requested operation",
+    );
+    expect(request.outputs.mode).toBe("${{ steps.route.outputs.mode }}");
+    expect(requestStep.id).toBe("request");
+    expect(routeStep.id).toBe("route");
+    expect(requestStep.env.RAW_REPAIR_R2).toBeUndefined();
+    expect(routeStep.env.RAW_REPAIR_R2).toBe(
+      "${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}",
+    );
+    expect(requestStep.run).toContain("reject_line_breaks request_id");
+    expect(requestStep.run).toContain("printf 'tag=%s\\nrequest_id=%s\\n'");
+    expect(routeStep.run).toContain("printf 'mode=%s\\n'");
+  });
+
+  it("rejects multiline output injection before writing request outputs", () => {
+    const { caller } = loadProductionWorkflows();
+    const script = getRun(
+      caller.jobs.request,
+      "Validate request and correlation id",
+    );
+    const valid = runBashScript(script, requestEnvironment);
+    expect(valid.error).toBeUndefined();
+    expect(valid.status).toBe(0);
+    expect(valid.githubOutput).toBe(
+      "tag=v3.20.1\nrequest_id=audit-request-1234\n",
+    );
+
+    const attacks = [
+      {
+        INPUT_REQUEST_ID: "audit-request-1234\nmode=promote",
+      },
+      {
+        INPUT_REQUEST_ID: "audit-request-1234\rmode=promote",
+      },
+      {
+        TAG: "v3.20.1\nrequest_id=forged-request",
+      },
+    ];
+    for (const attack of attacks) {
+      const result = runBashScript(script, {
+        ...requestEnvironment,
+        ...attack,
+      });
+      expect(result.status, JSON.stringify(attack)).not.toBe(0);
+      expect(result.githubOutput, JSON.stringify(attack)).toBe("");
+    }
+  });
+
+  it("exports verified routing fields from separate successful steps", () => {
     const { caller } = loadProductionWorkflows();
     const verification = caller.jobs["verify-release"];
     const verifyStep = verification.steps.find(
       (step) =>
         step.name === "Verify signed provenance without write credentials",
     );
+    const routeStep = verification.steps.find(
+      (step) => step.name === "Export verified operation",
+    );
     expect(verification.outputs.tag).toBe("${{ steps.verify.outputs.tag }}");
     expect(verification.outputs.request_id).toBe(
       "${{ steps.verify.outputs.request_id }}",
     );
-    expect(verification.outputs.mode).toBe("${{ steps.verify.outputs.mode }}");
+    expect(verification.outputs.mode).toBe("${{ steps.route.outputs.mode }}");
     expect(verifyStep.env.REQUEST_ID).toBe(
       "${{ needs.request.outputs.request_id }}",
     );
-    expect(verifyStep.run).toContain(
-      "tag=%s\\nrequest_id=%s\\nmode=%s\\nrelease_id=%s",
-    );
-    expect(verifyStep.run).toContain(
-      '"$TAG" "$REQUEST_ID" "$MODE" "$RELEASE_ID"',
-    );
-    expect(verifyStep.run).toContain("Invalid verified request id");
+    expect(verifyStep.run).toContain("tag=%s\\nrequest_id=%s\\nrelease_id=%s");
+    expect(verifyStep.run).toContain('"$TAG" "$REQUEST_ID" "$RELEASE_ID"');
+    expect(verifyStep.run).toContain("reject_line_breaks request_id");
+    expect(routeStep.id).toBe("route");
+    expect(routeStep.run).toContain("promote|repair");
+    expect(routeStep.run).toContain("printf 'mode=%s\\n'");
   });
 
-  it("fails closed unless the selected route and every terminal job complete", () => {
+  it("pins the complete terminal gate and rejects a short circuit", () => {
     const { caller } = loadProductionWorkflows();
-    const gate = caller.jobs["promotion-gate"];
-    const script = getRun(gate, "Validate complete promotion graph");
-    expect(gate.if).toBe("always()");
-    expect(script).toContain(
-      'require_result promote-stable "$PROMOTE_STABLE_RESULT" success',
+    caller.jobs["promotion-gate"].steps[0].run =
+      `exit 0\n${caller.jobs["promotion-gate"].steps[0].run}`;
+    expect(() => validatePromotionPermissionContract(caller)).toThrow(
+      "promotion-gate step definition must match the reviewed SHA-256 allowlist",
     );
-    expect(script).toContain(
-      'require_result authorize-repair "$AUTHORIZE_REPAIR_RESULT" success',
+  });
+
+  it.each([
+    ["promote", promoteGateEnvironment],
+    ["repair", repairGateEnvironment],
+  ])("accepts the complete %s lifecycle", (_mode, environment) => {
+    const { caller } = loadProductionWorkflows();
+    const script = getRun(
+      caller.jobs["promotion-gate"],
+      "Validate complete promotion graph",
     );
-    expect(script).toContain(
-      'require_result verify-published "$VERIFY_PUBLISHED_RESULT" success',
+    const result = runBashScript(script, environment);
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+  });
+
+  it.each([
+    ["promote", promoteGateEnvironment],
+    ["repair", repairGateEnvironment],
+  ])(
+    "rejects every unexpected success/skipped/failure/cancelled state in %s mode",
+    (_mode, environment) => {
+      const { caller } = loadProductionWorkflows();
+      const script = getRun(
+        caller.jobs["promotion-gate"],
+        "Validate complete promotion graph",
+      );
+      const resultStates = ["success", "skipped", "failure", "cancelled"];
+      for (const [name, expected] of Object.entries(environment).filter(
+        ([name]) => name.endsWith("_RESULT"),
+      )) {
+        for (const state of resultStates.filter(
+          (state) => state !== expected,
+        )) {
+          const result = runBashScript(script, {
+            ...environment,
+            [name]: state,
+          });
+          expect(result.status, `${name}=${state}`).not.toBe(0);
+        }
+      }
+    },
+  );
+
+  it("rejects missing, invalid, or mismatched verified modes", () => {
+    const { caller } = loadProductionWorkflows();
+    const script = getRun(
+      caller.jobs["promotion-gate"],
+      "Validate complete promotion graph",
     );
-    expect(script).toContain(
-      'require_result sync-r2 "$SYNC_R2_RESULT" success',
-    );
-    expect(script).toContain('[ "$VERIFIED_MODE" = "$REQUEST_MODE" ]');
+    for (const override of [
+      { REQUEST_MODE: "" },
+      { REQUEST_MODE: "invalid" },
+      { VERIFIED_MODE: "" },
+      { VERIFIED_MODE: "repair" },
+    ]) {
+      const result = runBashScript(script, {
+        ...promoteGateEnvironment,
+        ...override,
+      });
+      expect(result.status, JSON.stringify(override)).not.toBe(0);
+    }
   });
 });
 

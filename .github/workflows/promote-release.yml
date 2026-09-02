@@ -44,13 +44,12 @@ jobs:
     outputs:
       tag: ${{ steps.request.outputs.tag }}
       request_id: ${{ steps.request.outputs.request_id }}
-      mode: ${{ steps.request.outputs.mode }}
+      mode: ${{ steps.route.outputs.mode }}
     steps:
       - name: Validate request and correlation id
         id: request
         env:
           INPUT_REQUEST_ID: ${{ inputs.request_id || github.event.client_payload.request_id || '' }}
-          RAW_REPAIR_R2: ${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Promotion must run from the protected main branch"; exit 1; }
@@ -58,21 +57,36 @@ jobs:
             echo "::error::Unexpected repository_dispatch action"
             exit 1
           fi
-          case "$RAW_REPAIR_R2" in
-            true) mode=repair ;;
-            false|'') mode=promote ;;
-            *) echo "::error::repair_r2 must be a boolean"; exit 1 ;;
-          esac
+          reject_line_breaks() {
+            case "$2" in
+              *$'\r'*|*$'\n'*) echo "::error::$1 must be a single line"; exit 1 ;;
+            esac
+          }
+          reject_line_breaks tag "$TAG"
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Tag must match vX.Y.Z"; exit 1; }
           request_id="$INPUT_REQUEST_ID"
           if [ -z "$request_id" ]; then
             request_id="promote-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
           fi
+          reject_line_breaks request_id "$request_id"
           printf '%s' "$request_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || {
             echo "::error::request_id must be 8-128 characters of [A-Za-z0-9._-]"
             exit 1
           }
-          printf 'tag=%s\nrequest_id=%s\nmode=%s\n' "$TAG" "$request_id" "$mode" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nrequest_id=%s\n' "$TAG" "$request_id" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve requested operation
+        id: route
+        env:
+          RAW_REPAIR_R2: ${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}
+        run: |
+          set -euo pipefail
+          case "$RAW_REPAIR_R2" in
+            true) mode=repair ;;
+            false|'') mode=promote ;;
+            *) echo "::error::repair_r2 must be a boolean"; exit 1 ;;
+          esac
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
 
   stage-draft:
     name: Isolate draft release bytes
@@ -378,7 +392,7 @@ jobs:
     outputs:
       tag: ${{ steps.verify.outputs.tag }}
       request_id: ${{ steps.verify.outputs.request_id }}
-      mode: ${{ steps.verify.outputs.mode }}
+      mode: ${{ steps.route.outputs.mode }}
       release_id: ${{ steps.verify.outputs.release_id }}
       source_sha: ${{ steps.verify.outputs.source_sha }}
       release_tooling_sha: ${{ steps.verify.outputs.release_tooling_sha }}
@@ -413,6 +427,17 @@ jobs:
           RELEASE_PHASE: ${{ needs.stage-draft.outputs.release_phase || needs.stage-stable.outputs.release_phase }}
         run: |
           set -euo pipefail
+          reject_line_breaks() {
+            case "$2" in
+              *$'\r'*|*$'\n'*) echo "::error::$1 must be a single line"; exit 1 ;;
+            esac
+          }
+          reject_line_breaks tag "$TAG"
+          reject_line_breaks request_id "$REQUEST_ID"
+          reject_line_breaks release_id "$RELEASE_ID"
+          reject_line_breaks source_sha "$SOURCE_SHA"
+          reject_line_breaks verification_tooling_sha "$VERIFICATION_TOOLING_SHA"
+          reject_line_breaks release_phase "$RELEASE_PHASE"
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Invalid verified tag"; exit 1; }
           printf '%s' "$REQUEST_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || { echo "::error::Invalid verified request id"; exit 1; }
           printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid staged release id"; exit 1; }
@@ -452,6 +477,10 @@ jobs:
           release_tooling_sha=$(jq -r .toolingSha promotion-stage/release-assets/provenance.json)
           workflow_run_id=$(jq -r .workflowRunId promotion-stage/release-assets/provenance.json)
           workflow_run_attempt=$(jq -r '.workflowRunAttempt // empty' promotion-stage/release-assets/provenance.json)
+          reject_line_breaks release_tooling_sha "$release_tooling_sha"
+          reject_line_breaks workflow_run_id "$workflow_run_id"
+          reject_line_breaks workflow_run_attempt "$workflow_run_attempt"
+          reject_line_breaks asset_snapshot_sha256 "$snapshot_sha"
           printf '%s' "$release_tooling_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid release tooling SHA in provenance"; exit 1; }
           printf '%s' "$workflow_run_id" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run id in provenance"; exit 1; }
           printf '%s' "$workflow_run_attempt" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid release workflow run attempt in provenance"; exit 1; }
@@ -468,8 +497,20 @@ jobs:
             and .repository.full_name == $repo and .run_attempt == $attempt
             and .conclusion == "success"
           ' >/dev/null || { echo "::error::Signed provenance is not bound to a successful protected release workflow run"; exit 1; }
-          printf 'tag=%s\nrequest_id=%s\nmode=%s\nrelease_id=%s\nsource_sha=%s\nrelease_tooling_sha=%s\nverification_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\nrelease_phase=%s\n' \
-            "$TAG" "$REQUEST_ID" "$MODE" "$RELEASE_ID" "$SOURCE_SHA" "$release_tooling_sha" "$VERIFICATION_TOOLING_SHA" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" "$RELEASE_PHASE" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nrequest_id=%s\nrelease_id=%s\nsource_sha=%s\nrelease_tooling_sha=%s\nverification_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\nrelease_phase=%s\n' \
+            "$TAG" "$REQUEST_ID" "$RELEASE_ID" "$SOURCE_SHA" "$release_tooling_sha" "$VERIFICATION_TOOLING_SHA" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" "$RELEASE_PHASE" >> "$GITHUB_OUTPUT"
+
+      - name: Export verified operation
+        id: route
+        env:
+          MODE: ${{ needs.request.outputs.mode }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            promote|repair) ;;
+            *) echo "::error::Invalid verified promotion mode"; exit 1 ;;
+          esac
+          printf 'mode=%s\n' "$MODE" >> "$GITHUB_OUTPUT"
 
   promote-stable:
     name: Commit immutable stable release
