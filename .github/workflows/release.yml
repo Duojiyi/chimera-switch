@@ -128,13 +128,13 @@ jobs:
       # destination before initializing Git, so the trusted tooling checkout must
       # be created afterward in a separate path.
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-release.outputs.sha }}
           persist-credentials: false
 
       - name: Checkout trusted release scripts
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Keep validation and artifact tooling on the reviewed default branch so
           # a repair of an older immutable tag does not execute stale tag scripts.
@@ -635,7 +635,7 @@ jobs:
       TOOLING_SHA: ${{ needs.validate-release.outputs.tooling_sha }}
     steps:
       - name: Checkout trusted signer tooling
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-release.outputs.tooling_sha }}
           path: .signing-tooling
@@ -969,7 +969,7 @@ jobs:
       UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
     steps:
       - name: Checkout trusted release scripts
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-release.outputs.tooling_sha }}
           path: .release-scripts
@@ -1023,7 +1023,7 @@ jobs:
       UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
     steps:
       - name: Checkout trusted release verifier
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate-release.outputs.tooling_sha }}
           path: .release-scripts
