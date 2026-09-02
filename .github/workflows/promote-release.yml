@@ -376,9 +376,9 @@ jobs:
       contents: read
       actions: read
     outputs:
-      tag: ${{ needs.request.outputs.tag }}
-      request_id: ${{ needs.request.outputs.request_id }}
-      mode: ${{ needs.request.outputs.mode }}
+      tag: ${{ steps.verify.outputs.tag }}
+      request_id: ${{ steps.verify.outputs.request_id }}
+      mode: ${{ steps.verify.outputs.mode }}
       release_id: ${{ steps.verify.outputs.release_id }}
       source_sha: ${{ steps.verify.outputs.source_sha }}
       release_tooling_sha: ${{ steps.verify.outputs.release_tooling_sha }}
@@ -406,12 +406,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ needs.request.outputs.mode }}
+          REQUEST_ID: ${{ needs.request.outputs.request_id }}
           RELEASE_ID: ${{ needs.stage-draft.outputs.release_id || needs.stage-stable.outputs.release_id }}
           SOURCE_SHA: ${{ needs.stage-draft.outputs.source_sha || needs.stage-stable.outputs.source_sha }}
           VERIFICATION_TOOLING_SHA: ${{ needs.stage-draft.outputs.verification_tooling_sha || needs.stage-stable.outputs.verification_tooling_sha }}
           RELEASE_PHASE: ${{ needs.stage-draft.outputs.release_phase || needs.stage-stable.outputs.release_phase }}
         run: |
           set -euo pipefail
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::Invalid verified tag"; exit 1; }
+          printf '%s' "$REQUEST_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || { echo "::error::Invalid verified request id"; exit 1; }
           printf '%s' "$RELEASE_ID" | grep -Eq '^[1-9][0-9]*$' || { echo "::error::Invalid staged release id"; exit 1; }
           printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid staged source SHA"; exit 1; }
           printf '%s' "$VERIFICATION_TOOLING_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Invalid verification tooling SHA"; exit 1; }
@@ -465,8 +468,8 @@ jobs:
             and .repository.full_name == $repo and .run_attempt == $attempt
             and .conclusion == "success"
           ' >/dev/null || { echo "::error::Signed provenance is not bound to a successful protected release workflow run"; exit 1; }
-          printf 'release_id=%s\nsource_sha=%s\nrelease_tooling_sha=%s\nverification_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\nrelease_phase=%s\n' \
-            "$RELEASE_ID" "$SOURCE_SHA" "$release_tooling_sha" "$VERIFICATION_TOOLING_SHA" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" "$RELEASE_PHASE" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nrequest_id=%s\nmode=%s\nrelease_id=%s\nsource_sha=%s\nrelease_tooling_sha=%s\nverification_tooling_sha=%s\nworkflow_run_id=%s\nworkflow_run_attempt=%s\nasset_snapshot_sha256=%s\nrelease_phase=%s\n' \
+            "$TAG" "$REQUEST_ID" "$MODE" "$RELEASE_ID" "$SOURCE_SHA" "$release_tooling_sha" "$VERIFICATION_TOOLING_SHA" "$workflow_run_id" "$workflow_run_attempt" "$snapshot_sha" "$RELEASE_PHASE" >> "$GITHUB_OUTPUT"
 
   promote-stable:
     name: Commit immutable stable release
@@ -712,3 +715,71 @@ jobs:
       R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
       R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+  promotion-gate:
+    name: Require complete promotion result
+    needs:
+      [
+        request,
+        stage-draft,
+        stage-stable,
+        verify-release,
+        promote-stable,
+        authorize-repair,
+        verify-published,
+        sync-r2,
+      ]
+    if: always()
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Validate complete promotion graph
+        env:
+          REQUEST_MODE: ${{ needs.request.outputs.mode }}
+          VERIFIED_MODE: ${{ needs.verify-release.outputs.mode }}
+          REQUEST_RESULT: ${{ needs.request.result }}
+          STAGE_DRAFT_RESULT: ${{ needs.stage-draft.result }}
+          STAGE_STABLE_RESULT: ${{ needs.stage-stable.result }}
+          VERIFY_RELEASE_RESULT: ${{ needs.verify-release.result }}
+          PROMOTE_STABLE_RESULT: ${{ needs.promote-stable.result }}
+          AUTHORIZE_REPAIR_RESULT: ${{ needs.authorize-repair.result }}
+          VERIFY_PUBLISHED_RESULT: ${{ needs.verify-published.result }}
+          SYNC_R2_RESULT: ${{ needs.sync-r2.result }}
+        run: |
+          set -euo pipefail
+          require_result() {
+            [ "$2" = "$3" ] || {
+              echo "::error::$1 concluded '$2'; expected '$3'"
+              exit 1
+            }
+          }
+
+          require_result request "$REQUEST_RESULT" success
+          require_result verify-release "$VERIFY_RELEASE_RESULT" success
+          require_result verify-published "$VERIFY_PUBLISHED_RESULT" success
+          require_result sync-r2 "$SYNC_R2_RESULT" success
+          [ "$VERIFIED_MODE" = "$REQUEST_MODE" ] || {
+            echo "::error::Verified mode output was not propagated ($VERIFIED_MODE != $REQUEST_MODE)"
+            exit 1
+          }
+
+          case "$REQUEST_MODE" in
+            promote)
+              require_result stage-draft "$STAGE_DRAFT_RESULT" success
+              require_result stage-stable "$STAGE_STABLE_RESULT" skipped
+              require_result promote-stable "$PROMOTE_STABLE_RESULT" success
+              require_result authorize-repair "$AUTHORIZE_REPAIR_RESULT" skipped
+              ;;
+            repair)
+              require_result stage-draft "$STAGE_DRAFT_RESULT" skipped
+              require_result stage-stable "$STAGE_STABLE_RESULT" success
+              require_result promote-stable "$PROMOTE_STABLE_RESULT" skipped
+              require_result authorize-repair "$AUTHORIZE_REPAIR_RESULT" success
+              ;;
+            *)
+              echo "::error::Missing or invalid promotion mode: $REQUEST_MODE"
+              exit 1
+              ;;
+          esac
+          echo "Promotion workflow completed the full $REQUEST_MODE contract."

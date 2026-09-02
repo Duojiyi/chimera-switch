@@ -27,6 +27,7 @@ const expectedPromotionPermissions = Object.freeze({
   "promote-stable": Object.freeze({ contents: "write" }),
   "authorize-repair": Object.freeze({ contents: "read" }),
   "verify-published": Object.freeze({ contents: "read" }),
+  "promotion-gate": Object.freeze({ contents: "read" }),
 });
 
 const approvedWriterJobs = new Set(["stage-draft", "promote-stable"]);
@@ -76,9 +77,9 @@ const expectedPromotionGraph = Object.freeze({
     needs: Object.freeze(["request", "stage-draft", "stage-stable"]),
     if: "always() && needs.request.result == 'success' && ((needs.request.outputs.mode == 'promote' && needs.stage-draft.result == 'success') || (needs.request.outputs.mode == 'repair' && needs.stage-stable.result == 'success'))",
     outputs: Object.freeze({
-      tag: "${{ needs.request.outputs.tag }}",
-      request_id: "${{ needs.request.outputs.request_id }}",
-      mode: "${{ needs.request.outputs.mode }}",
+      tag: "${{ steps.verify.outputs.tag }}",
+      request_id: "${{ steps.verify.outputs.request_id }}",
+      mode: "${{ steps.verify.outputs.mode }}",
       release_id: "${{ steps.verify.outputs.release_id }}",
       source_sha: "${{ steps.verify.outputs.source_sha }}",
       release_tooling_sha: "${{ steps.verify.outputs.release_tooling_sha }}",
@@ -129,6 +130,20 @@ const expectedPromotionGraph = Object.freeze({
         "${{ needs.verify-release.outputs.verification_tooling_sha }}",
       require_r2: "${{ needs.verify-release.outputs.mode == 'repair' }}",
     }),
+  }),
+  "promotion-gate": Object.freeze({
+    needs: Object.freeze([
+      "request",
+      "stage-draft",
+      "stage-stable",
+      "verify-release",
+      "promote-stable",
+      "authorize-repair",
+      "verify-published",
+      "sync-r2",
+    ]),
+    if: "always()",
+    outputs: Object.freeze({}),
   }),
 });
 
@@ -495,6 +510,7 @@ describe("release promotion permissions", () => {
       "authorize-repair",
       "verify-published",
       "sync-r2",
+      "promotion-gate",
     ]) {
       expect(grantsWrite(caller.jobs[jobName].permissions)).toBe(false);
     }
@@ -563,6 +579,8 @@ describe("release promotion permissions", () => {
   });
 
   it.each([
+    ["verify-release", "tag", "${{ needs.request.outputs.tag }}"],
+    ["verify-release", "mode", "${{ needs.request.outputs.mode }}"],
     ["verify-release", "release_id", "${{ steps.verify.outputs.source_sha }}"],
     [
       "verify-release",
@@ -618,6 +636,52 @@ describe("release promotion permissions", () => {
     expect(() => validatePromotionPermissionContract(caller)).toThrow(
       "verify-published checkout must not persist credentials",
     );
+  });
+});
+
+describe("release promotion routing", () => {
+  it("exports routing fields from the successful verification step", () => {
+    const { caller } = loadProductionWorkflows();
+    const verification = caller.jobs["verify-release"];
+    const verifyStep = verification.steps.find(
+      (step) =>
+        step.name === "Verify signed provenance without write credentials",
+    );
+    expect(verification.outputs.tag).toBe("${{ steps.verify.outputs.tag }}");
+    expect(verification.outputs.request_id).toBe(
+      "${{ steps.verify.outputs.request_id }}",
+    );
+    expect(verification.outputs.mode).toBe("${{ steps.verify.outputs.mode }}");
+    expect(verifyStep.env.REQUEST_ID).toBe(
+      "${{ needs.request.outputs.request_id }}",
+    );
+    expect(verifyStep.run).toContain(
+      "tag=%s\\nrequest_id=%s\\nmode=%s\\nrelease_id=%s",
+    );
+    expect(verifyStep.run).toContain(
+      '"$TAG" "$REQUEST_ID" "$MODE" "$RELEASE_ID"',
+    );
+    expect(verifyStep.run).toContain("Invalid verified request id");
+  });
+
+  it("fails closed unless the selected route and every terminal job complete", () => {
+    const { caller } = loadProductionWorkflows();
+    const gate = caller.jobs["promotion-gate"];
+    const script = getRun(gate, "Validate complete promotion graph");
+    expect(gate.if).toBe("always()");
+    expect(script).toContain(
+      'require_result promote-stable "$PROMOTE_STABLE_RESULT" success',
+    );
+    expect(script).toContain(
+      'require_result authorize-repair "$AUTHORIZE_REPAIR_RESULT" success',
+    );
+    expect(script).toContain(
+      'require_result verify-published "$VERIFY_PUBLISHED_RESULT" success',
+    );
+    expect(script).toContain(
+      'require_result sync-r2 "$SYNC_R2_RESULT" success',
+    );
+    expect(script).toContain('[ "$VERIFIED_MODE" = "$REQUEST_MODE" ]');
   });
 });
 
