@@ -514,7 +514,10 @@ jobs:
 
   promote-stable:
     name: Commit immutable stable release
-    if: needs.verify-release.outputs.mode == 'promote'
+    if: >-
+      always()
+      && needs.verify-release.result == 'success'
+      && needs.verify-release.outputs.mode == 'promote'
     needs: [verify-release]
     runs-on: ubuntu-22.04
     environment: release
@@ -615,7 +618,10 @@ jobs:
 
   authorize-repair:
     name: Authorize read-only R2 repair
-    if: needs.verify-release.outputs.mode == 'repair'
+    if: >-
+      always()
+      && needs.verify-release.result == 'success'
+      && needs.verify-release.outputs.mode == 'repair'
     needs: [verify-release]
     runs-on: ubuntu-22.04
     environment: release
