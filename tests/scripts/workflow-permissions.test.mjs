@@ -99,12 +99,12 @@ const expectedPromotionGraph = Object.freeze({
   }),
   "promote-stable": Object.freeze({
     needs: Object.freeze(["verify-release"]),
-    if: "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'",
+    if: "always() && !cancelled() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'",
     outputs: Object.freeze({}),
   }),
   "authorize-repair": Object.freeze({
     needs: Object.freeze(["verify-release"]),
-    if: "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'",
+    if: "always() && !cancelled() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'",
     outputs: Object.freeze({}),
   }),
   "verify-published": Object.freeze({
@@ -123,7 +123,7 @@ const expectedPromotionGraph = Object.freeze({
       "authorize-repair",
       "verify-published",
     ]),
-    if: "always() && needs.verify-published.result == 'success'",
+    if: "always() && !cancelled() && needs.verify-published.result == 'success'",
     outputs: Object.freeze({}),
     with: Object.freeze({
       tag: "${{ needs.verify-release.outputs.tag }}",
@@ -540,13 +540,13 @@ function validatePromotionPermissionContract(workflow) {
   }
   if (
     publisher?.if !==
-    "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'"
+    "always() && !cancelled() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'promote'"
   ) {
     throw new Error("promote-stable must require verified promote mode");
   }
   if (
     repairAuthorizer?.if !==
-    "always() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'"
+    "always() && !cancelled() && needs.verify-release.result == 'success' && needs.verify-release.outputs.mode == 'repair'"
   ) {
     throw new Error("authorize-repair must require verified repair mode");
   }
@@ -684,6 +684,7 @@ describe("release promotion permissions", () => {
     "promote-stable",
     "authorize-repair",
     "verify-published",
+    "sync-r2",
   ])("rejects removing always() from %s", (jobName) => {
     const { caller } = loadProductionWorkflows();
     caller.jobs[jobName].if = caller.jobs[jobName].if.replace(
@@ -694,6 +695,20 @@ describe("release promotion permissions", () => {
       `${jobName} task graph or output wiring changed`,
     );
   });
+
+  it.each(["promote-stable", "authorize-repair", "sync-r2"])(
+    "requires cancellation protection on side-effecting %s",
+    (jobName) => {
+      const { caller } = loadProductionWorkflows();
+      caller.jobs[jobName].if = caller.jobs[jobName].if.replace(
+        "&& !cancelled() ",
+        "",
+      );
+      expect(() => validatePromotionPermissionContract(caller)).toThrow(
+        `${jobName} task graph or output wiring changed`,
+      );
+    },
+  );
 
   it("rejects an extra checkout even when its credentials setting looks safe", () => {
     const { caller } = loadProductionWorkflows();

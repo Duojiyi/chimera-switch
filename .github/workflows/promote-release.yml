@@ -516,6 +516,7 @@ jobs:
     name: Commit immutable stable release
     if: >-
       always()
+      && !cancelled()
       && needs.verify-release.result == 'success'
       && needs.verify-release.outputs.mode == 'promote'
     needs: [verify-release]
@@ -620,6 +621,7 @@ jobs:
     name: Authorize read-only R2 repair
     if: >-
       always()
+      && !cancelled()
       && needs.verify-release.result == 'success'
       && needs.verify-release.outputs.mode == 'repair'
     needs: [verify-release]
@@ -746,6 +748,7 @@ jobs:
     needs: [verify-release, promote-stable, authorize-repair, verify-published]
     if: >-
       always()
+      && !cancelled()
       && needs.verify-published.result == 'success'
     permissions:
       contents: read
