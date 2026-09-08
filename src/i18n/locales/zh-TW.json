@@ -42,7 +42,8 @@
     "deleting": "刪除中...",
     "auto": "自動",
     "enabled": "已啟用",
-    "notSet": "未設定"
+    "notSet": "未設定",
+    "collapse": "收合"
   },
   "firstRunNotice": {
     "title": "歡迎使用 Chimera Switch",
@@ -979,7 +980,8 @@
       "effectiveApiRequired": "模型 {{id}} 必須直接設定或從供應商繼承 API",
       "effectiveBaseUrlRequired": "模型 {{id}} 必須直接設定或從供應商繼承基礎 URL",
       "duplicateModel": "模型 ID {{id}} 重複",
-      "modelRequired": "請至少新增一個模型"
+      "modelRequired": "請至少新增一個模型",
+      "providerKeyDuplicate": "該供應商標識已存在"
     },
     "current": {
       "readFailed": "無法讀取 Pi 供應商設定",
@@ -1381,6 +1383,7 @@
     "reauthLogin": "重新登入",
     "reauthSelectHint": "該帳號需重新登入以啟用託管綁定。",
     "reauthNow": "立即重新登入",
+    "duplicateAccount": "該 ChatGPT 帳號已新增，請直接使用現有帳號。",
     "loggedInAccounts": "已登入帳號",
     "defaultAccount": "預設",
     "selected": "已選取",
@@ -2159,6 +2162,7 @@
     }
   },
   "profiles": {
+    "switcherAriaLabel": "專案：{{name}}",
     "switcherTooltip": {
       "claude": "專案：一鍵切換 Claude Code 的供應商 / MCP / Skills / 記憶檔案",
       "claude-desktop": "專案：一鍵切換 Claude Desktop 的供應商",
@@ -2842,6 +2846,7 @@
     },
     "switchFailed": "切換失敗：{{error}}",
     "takeover": {
+      "ariaLabel": "{{appLabel}} 本地路由",
       "hint": "選擇要路由的應用程式，啟用後該應用程式的請求將透過本地路由轉發",
       "enabled": "{{app}} 路由已啟用",
       "disabled": "{{app}} 路由已關閉",
