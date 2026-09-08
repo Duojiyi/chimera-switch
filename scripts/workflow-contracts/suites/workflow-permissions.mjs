@@ -3,11 +3,25 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "../harness.mjs";
+
+// This suite lives in a fork-owned nested package, so anchor repository paths
+// to the checkout root instead of the current working directory.
+const repositoryRoot = path.resolve(
+  fileURLToPath(import.meta.url),
+  "..",
+  "..",
+  "..",
+  "..",
+);
 
 const readWorkflow = (name) =>
-  fs.readFileSync(path.resolve(".github/workflows", name), "utf8");
+  fs.readFileSync(
+    path.resolve(repositoryRoot, ".github/workflows", name),
+    "utf8",
+  );
 
 const uploadArtifactAction =
   "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
@@ -216,7 +230,7 @@ function runBashScript(script, environment = {}) {
   const outputPath = path.join(directory, "github-output.txt");
   try {
     const result = spawnSync(getBashExecutable(), ["-c", script], {
-      cwd: process.cwd(),
+      cwd: repositoryRoot,
       encoding: "utf8",
       env: {
         ...process.env,

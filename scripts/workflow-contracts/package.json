@@ -1,0 +1,14 @@
+{
+  "name": "chimera-workflow-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fork-owned release workflow contract tests, isolated from the upstream-owned root manifest",
+  "scripts": {
+    "test": "node run-contracts.mjs"
+  },
+  "packageManager": "pnpm@10.12.3",
+  "devDependencies": {
+    "yaml": "2.9.0"
+  }
+}

@@ -100,6 +100,15 @@ jobs:
       - name: Unit tests
         run: pnpm test:unit
 
+      - name: Workflow contract tests
+        # Fork-owned tooling with its own manifest and lockfile: the root
+        # package.json is upstream-owned (see scripts/check-upstream-manifest.mjs),
+        # so these release-workflow contracts must not add dependencies there.
+        working-directory: scripts/workflow-contracts
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          node run-contracts.mjs
+
       - name: Debrand guard scan
         run: node scripts/check-debrand.mjs
 
