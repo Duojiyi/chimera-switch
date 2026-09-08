@@ -1,0 +1,3 @@
+# Declares this directory as its own pnpm root so the upstream-owned root
+# workspace never resolves or installs these fork-only tooling dependencies.
+packages: []

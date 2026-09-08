@@ -240,6 +240,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         env:
           TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
           BASE_SHA: ${{ steps.base.outputs.base_sha }}
         run: |
           set -euo pipefail
@@ -258,6 +259,15 @@ jobs:
           node scripts/debrand.mjs
           node scripts/align-version.mjs "${TAG#v}"
           cargo fmt --manifest-path src-tauri/Cargo.toml
+          # The conflict policy above resolves the root manifest and lockfile to
+          # theirs, so a fork-only dependency in package.json disappears on every
+          # upstream release and desynchronizes pnpm-lock.yaml. Report that cause
+          # directly instead of failing later with ERR_PNPM_OUTDATED_LOCKFILE.
+          # Fork tooling dependencies belong in a fork-owned nested package such
+          # as scripts/workflow-contracts, whose contract suite runs in CI (this
+          # gate restores .github and scripts from BASE_SHA, so those trusted
+          # paths cannot change during a sync).
+          node scripts/check-upstream-manifest.mjs "$UPSTREAM_SHA"
           # Install dependencies without executing scripts from the upstream tree.
           pnpm install --frozen-lockfile --ignore-scripts
           # Call fixed binaries directly. Do not execute scripts from the
