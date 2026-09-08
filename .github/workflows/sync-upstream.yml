@@ -478,7 +478,7 @@ jobs:
           git -C "$push_repo" diff --quiet "$BASE_SHA" "$CANDIDATE_SHA" -- .github scripts || { echo "::error::Candidate changes trusted workflow or script paths"; exit 1; }
 
           branch_name="automation/upstream-sync-$TAG"
-          remote_branch_sha=$(git_auth ls-remote origin "refs/heads/$branch_name" | awk 'NR == 1 {print $1}')
+          remote_branch_sha=$(git_auth -C "$push_repo" ls-remote origin "refs/heads/$branch_name" | awk 'NR == 1 {print $1}')
           if [ -n "$remote_branch_sha" ] && [ "$remote_branch_sha" != "$CANDIDATE_SHA" ]; then
             echo "::error::Sync branch $branch_name already exists at a different commit; refusing to overwrite it."
             exit 1
@@ -496,6 +496,12 @@ jobs:
           fi
           echo "Sync PR: #$pr_number"
 
+          # GitHub 只是「尽力」填充 workflow_runs[].pull_requests，本仓库的同仓 PR 上
+          # 它实测为空数组，因此不能把它当作硬性条件——否则下面的轮询会一直匹配不到
+          # 而空转到超时。有值时仍要求精确匹配（多一层绑定），为空时退回到
+          # path + event + head_branch + head_sha + repository + run_attempt 绑定：
+          # PR 的 head/base SHA 由本循环内和合并前的 gh pr view 独立校验，合并本身
+          # 还带 --match-head-commit，所以「合入的正是被测树」这一保证不受影响。
           api_repository="https://api.github.com/repos/$REPOSITORY"
           encoded_branch=$(jq -rn --arg value "$branch_name" '$value | @uri')
           ci_run_id=""
@@ -529,16 +535,19 @@ jobs:
                     and .head_branch == $branch
                     and .head_sha == $head
                     and .repository.full_name == $repo
-                    and ([.pull_requests[]?
-                      | select(
-                        .number == $pr
-                        and .head.ref == $branch
-                        and .head.sha == $head
-                        and .head.repo.url == $api_repo
-                        and .base.ref == "main"
-                        and .base.sha == $base
-                        and .base.repo.url == $api_repo
-                      )] | length) == 1
+                    and (
+                      (.pull_requests | length) == 0
+                      or ([.pull_requests[]
+                        | select(
+                          .number == $pr
+                          and .head.ref == $branch
+                          and .head.sha == $head
+                          and .head.repo.url == $api_repo
+                          and .base.ref == "main"
+                          and .base.sha == $base
+                          and .base.repo.url == $api_repo
+                        )] | length) == 1
+                    )
                   )]
                 | sort_by(.created_at, .id)')
             if [ "$(printf '%s' "$matching_runs" | jq 'length')" -gt 0 ]; then
@@ -570,7 +579,7 @@ jobs:
             sleep 30
           done
 
-          current_main=$(git_auth ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')
+          current_main=$(git_auth -C "$push_repo" ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')
           [ "$current_main" = "$BASE_SHA" ] || { echo "::error::main changed while CI was running; refusing to merge a stale candidate"; exit 1; }
           pr_data=$(gh pr view "$pr_number" --repo "$REPOSITORY" --json state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid)
           [ "$(printf '%s' "$pr_data" | jq -r .state)" = OPEN ] || { echo "::error::PR is no longer open"; exit 1; }
@@ -597,16 +606,19 @@ jobs:
               and .run_attempt == $attempt
               and .status == "completed"
               and .conclusion == "success"
-              and ([.pull_requests[]?
-                | select(
-                  .number == $pr
-                  and .head.ref == $branch
-                  and .head.sha == $head
-                  and .head.repo.url == $api_repo
-                  and .base.ref == "main"
-                  and .base.sha == $base
-                  and .base.repo.url == $api_repo
-                )] | length) == 1
+              and (
+                (.pull_requests | length) == 0
+                or ([.pull_requests[]
+                  | select(
+                    .number == $pr
+                    and .head.ref == $branch
+                    and .head.sha == $head
+                    and .head.repo.url == $api_repo
+                    and .base.ref == "main"
+                    and .base.sha == $base
+                    and .base.repo.url == $api_repo
+                  )] | length) == 1
+              )
             ' >/dev/null || { echo "::error::Exact CI workflow run identity changed before merge"; exit 1; }
           final_ci_jobs=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$ci_run_id/attempts/$ci_run_attempt/jobs?per_page=100" --slurp \
             | jq '[.[] | .jobs[]]')
@@ -655,7 +667,7 @@ jobs:
           candidate_tree=$(git -C "$push_repo" rev-parse "$CANDIDATE_SHA^{tree}")
           merged_tree=$(git -C "$push_repo" rev-parse "$merged_sha^{tree}")
           [ "$candidate_tree" = "$merged_tree" ] || { echo "::error::Merged tree differs from the tested candidate tree"; exit 1; }
-          tag_refs=$(git_auth ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          tag_refs=$(git_auth -C "$push_repo" ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
           remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1; exit}')
           [ -z "$remote_tag_sha" ] && remote_tag_sha=$(printf '%s\n' "$tag_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1; exit}')
           if [ -n "$remote_tag_sha" ] && [ "$remote_tag_sha" != "$merged_sha" ]; then
