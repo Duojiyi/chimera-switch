@@ -102,7 +102,6 @@ export const providerPresets: ProviderPreset[] = [
     },
     apiFormat: "openai_chat",
     category: "third_party",
-    isCustomTemplate: true,
     icon: "openai",
     iconColor: "#10B981",
   },

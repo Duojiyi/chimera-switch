@@ -28,6 +28,7 @@ export const CONFIG = JSON.parse(
 );
 const RELAY = CONFIG.relay;
 const MODELS = CONFIG.models;
+const SPONSOR_TEST_FILES = CONFIG.sponsorTestFiles?.files ?? [];
 
 const log = (msg) => console.log(`[debrand] ${msg}`);
 
@@ -177,6 +178,65 @@ function replaceArrayKeepingOfficial(relPath, declRe, singleEntry) {
   return true;
 }
 
+/**
+ * 给预设文件里的顶层声明统一补 export。
+ *
+ * 上游把赞助商预设所需的模型目录 / 鉴权 / 路由辅助声明放在预设同一文件里，预设被
+ * 剪掉后它们就失去引用者，而上游 tsconfig 开着 noUnusedLocals，于是 tsc 报 TS6133
+ * 挡住同步门禁（上游 v3.20.2 一次带来 11 处）。tsconfig 属上游控制（冲突取 theirs），
+ * 不能在那里关掉。
+ *
+ * 这里不去判断「哪些失去了引用」——判断需要一套词法分析，而误判会静默改错代码。
+ * 统一补 export 在结构上就排除了 TS6133：导出的声明永远不算未使用，上游代码保持
+ * 原样，类型检查不被削弱，也不需要 @ts-ignore。幂等：已 export 的声明不再匹配。
+ * 规模很小（当前 10 个预设文件共 3 处未导出顶层声明）。
+ *
+ * 注意：补上的 export 可能让声明行超出 prettier 宽度，因此本脚本这一步的输出需要
+ * 随后的 prettier 归一化——sync-upstream 门禁在 debrand 之后就跑 prettier --write。
+ */
+function exportTopLevelDeclarations(relPath) {
+  const file = path.join(ROOT, relPath);
+  if (!fs.existsSync(file)) return;
+  const src = fs.readFileSync(file, "utf8");
+  const exported = [];
+  const next = src.replace(
+    /^(const|let|function|class)(\s+[A-Za-z_$][\w$]*)/gm,
+    (match, keyword, rest) => {
+      exported.push(rest.trim());
+      return `export ${keyword}${rest}`;
+    },
+  );
+  if (next === src) return;
+  fs.writeFileSync(file, next);
+  log(`OK   ${relPath} (导出顶层声明，避免剪除预设后触发 TS6133: ${exported.join(", ")})`);
+}
+
+/**
+ * 删除断言第三方/赞助商预设存在的上游测试文件。
+ *
+ * 这类测试（如 tests/config/tokenPlanProviderPresets.test.ts 断言 6 个腾讯 Token
+ * Plan 产品在 4 个 App 中存在）在预设被剪掉后必然失败，属于「去广告」的连带范围。
+ * fork 早期已手工删过 16 个，但那只靠合并冲突策略（一侧删除即保持删除）维持，
+ * 上游若无冲突地新增同类文件就会静默回流并挡住同步门禁。清单放在
+ * chimerahub.config.json，这里强制执行，check-debrand 再断言其不存在。
+ *
+ * 上游新增同类测试时，同步门禁会在 vitest 处失败，把新路径加进清单即可。
+ */
+function removeSponsorTests() {
+  const removed = [];
+  for (const relPath of SPONSOR_TEST_FILES) {
+    const file = path.join(ROOT, relPath);
+    if (!fs.existsSync(file)) continue;
+    fs.rmSync(file);
+    removed.push(relPath);
+  }
+  if (removed.length) {
+    log(`OK   删除断言赞助商预设的上游测试: ${removed.join(", ")}`);
+  } else {
+    log("SKIP 无断言赞助商预设的上游测试文件");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1) 各 App 的 ChimeraHub 唯一预设条目（模板输出与 prettier 格式一致）
 // ---------------------------------------------------------------------------
@@ -199,7 +259,6 @@ export const PRESETS = [
     },
     apiFormat: "openai_chat",
     category: "third_party",
-    isCustomTemplate: true,
     icon: "openai",
     iconColor: "#10B981",
   },`,
@@ -571,8 +630,11 @@ function main() {
   for (const p of PRESETS) {
     if (!replaceArrayKeepingOfficial(p.file, p.decl, p.entry)) {
       failures.push(p.file);
+      continue;
     }
+    exportTopLevelDeclarations(p.file);
   }
+  removeSponsorTests();
 
   log("=== 2) 切除 README 赞助区块 ===");
   for (const f of ["README.md", "README_ZH.md", "README_JA.md", "README_DE.md"]) {

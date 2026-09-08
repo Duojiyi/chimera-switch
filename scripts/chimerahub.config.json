@@ -28,5 +28,28 @@
     "packageName": "chimera-switch",
     "updaterEndpoint": "https://github.com/Duojiyi/chimera-switch/releases/latest/download/latest.json",
     "updaterPubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK"
+  },
+  "sponsorTestFiles": {
+    "comment": "断言第三方/赞助商预设存在的上游测试文件。debrand 剪掉这些预设后它们必然失败，因此 debrand 会删除本清单中的文件，check-debrand 断言它们不存在。上游新增同类测试时同步门禁会在 vitest 处失败，把新路径加到这里即可。",
+    "files": [
+      "src/config/codexProviderPresets.test.ts",
+      "src/config/jiekouProviderPresets.test.ts",
+      "src/config/ppioProviderPresets.test.ts",
+      "tests/config/claudeProviderPresets.test.ts",
+      "tests/config/codexChatProviderPresets.test.ts",
+      "tests/config/codexReasoningLevelPresets.test.ts",
+      "tests/config/doubaoSeedPresets.test.ts",
+      "tests/config/longcatProviderPresets.test.ts",
+      "tests/config/mimoTokenPlanPresets.test.ts",
+      "tests/config/opencodeProviderPresets.test.ts",
+      "tests/config/piProviderPresets.test.ts",
+      "tests/config/piThinkingProfiles.test.ts",
+      "tests/config/qianfanTokenPlanPresets.test.ts",
+      "tests/config/subrouterProviderPresets.test.ts",
+      "tests/config/therouterOpenCodeOpenClawPresets.test.ts",
+      "tests/config/therouterProviderPresets.test.ts",
+      "tests/config/tokenPlanProviderPresets.test.ts",
+      "tests/config/xaiOauthProviderPresets.test.ts"
+    ]
   }
 }
