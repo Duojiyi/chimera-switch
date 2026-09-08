@@ -55,7 +55,7 @@ export interface PiProviderPreset {
  * aligned with the OpenCode catalog, but Pi does not import or derive from
  * another application's presets at runtime.
  */
-const piProviderPresetDefinitions: PiProviderPreset[] = [
+export const piProviderPresetDefinitions: PiProviderPreset[] = [
   {
     name: "ChimeraHub",
     providerKey: "chimerahub",
@@ -78,7 +78,7 @@ const piProviderPresetDefinitions: PiProviderPreset[] = [
   },
 ];
 
-function materializeVerifiedThinkingProfiles(
+export function materializeVerifiedThinkingProfiles(
   preset: PiProviderPreset,
 ): PiProviderPreset {
   return {
