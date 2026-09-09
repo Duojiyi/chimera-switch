@@ -589,6 +589,7 @@ function loadProductionWorkflows() {
     caller: parseWorkflow("promote-release.yml"),
     callee: parseWorkflow("sync-r2.yml"),
     upstream: parseWorkflow("sync-upstream.yml"),
+    release: parseWorkflow("release.yml"),
   };
 }
 
@@ -755,7 +756,7 @@ describe("release promotion permissions", () => {
 
 describe("release promotion routing", () => {
   const requestEnvironment = Object.freeze({
-    GITHUB_EVENT_ACTION: "",
+    EVENT_ACTION: "",
     GITHUB_EVENT_NAME: "workflow_dispatch",
     GITHUB_REF: "refs/heads/main",
     GITHUB_RUN_ATTEMPT: "1",
@@ -810,6 +811,51 @@ describe("release promotion routing", () => {
     expect(requestStep.run).toContain("printf 'tag=%s\\nrequest_id=%s\\n'");
     expect(routeStep.run).toContain("printf 'mode=%s\\n'");
   });
+
+  it("passes repository dispatch actions through the supported event context", () => {
+    const { caller, release } = loadProductionWorkflows();
+    const releaseValidation = release.jobs["validate-release"].steps.find(
+      (step) => step.name === "Validate requested tag",
+    );
+    const promotionRequest = caller.jobs.request.steps.find(
+      (step) => step.name === "Validate request and correlation id",
+    );
+
+    expect(releaseValidation.env.EVENT_ACTION).toBe(
+      "${{ github.event.action || '' }}",
+    );
+    expect(promotionRequest.env.EVENT_ACTION).toBe(
+      "${{ github.event.action || '' }}",
+    );
+    expect(releaseValidation.run).toContain(
+      '[ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != release-request ]',
+    );
+    expect(promotionRequest.run).toContain(
+      '[ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != promote-release-request ]',
+    );
+    expect(releaseValidation.run).not.toContain("GITHUB_EVENT_ACTION");
+    expect(promotionRequest.run).not.toContain("GITHUB_EVENT_ACTION");
+  });
+
+  it.each([
+    ["promote-release-request", 0],
+    ["wrong-action", 1],
+  ])(
+    "handles repository dispatch action %s without an implicit env var",
+    (action, expectedStatus) => {
+      const { caller } = loadProductionWorkflows();
+      const requestStep = getRun(
+        caller.jobs.request,
+        "Validate request and correlation id",
+      );
+      const result = runBashScript(requestStep, {
+        ...requestEnvironment,
+        GITHUB_EVENT_NAME: "repository_dispatch",
+        EVENT_ACTION: action,
+      });
+      expect(result.status).toBe(expectedStatus);
+    },
+  );
 
   it("rejects multiline output injection before writing request outputs", () => {
     const { caller } = loadProductionWorkflows();

@@ -46,12 +46,13 @@ jobs:
           REQUESTED_TAG: ${{ inputs.tag || github.event.client_payload.tag || github.ref_name }}
           REQUESTED_TOOLING_SHA: ${{ inputs.tooling_sha || github.event.client_payload.tooling_sha || '' }}
           REQUESTED_REQUEST_ID: ${{ inputs.request_id || github.event.client_payload.request_id || '' }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
           RUN_SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$GITHUB_EVENT_ACTION" != release-request ]; then
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != release-request ]; then
             echo "::error::Unexpected repository_dispatch action"
             exit 1
           fi

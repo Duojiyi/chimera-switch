@@ -50,10 +50,11 @@ jobs:
         id: request
         env:
           INPUT_REQUEST_ID: ${{ inputs.request_id || github.event.client_payload.request_id || '' }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Promotion must run from the protected main branch"; exit 1; }
-          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$GITHUB_EVENT_ACTION" != promote-release-request ]; then
+          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != promote-release-request ]; then
             echo "::error::Unexpected repository_dispatch action"
             exit 1
           fi
