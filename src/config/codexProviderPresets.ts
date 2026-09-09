@@ -61,8 +61,15 @@ export function generateThirdPartyConfig(
   providerName: string,
   baseUrl: string,
   modelName = "gpt-5.6-sol",
+  options?: {
+    // 托管 OAuth 预设（requiresOAuth 卡）必须传 false：这类卡无静态 key，
+    // requires_openai_auth = true 会被后端 keyless 安全闸拒绝切换
+    // （provider.codex.config.official_auth_fallback）。
+    requiresOpenAiAuth?: boolean;
+  },
 ): string {
   const tomlString = (value: string) => JSON.stringify(value);
+  const requiresOpenAiAuth = options?.requiresOpenAiAuth ?? true;
 
   return `model_provider = "custom"
 model = ${tomlString(modelName)}
@@ -73,7 +80,48 @@ disable_response_storage = true
 name = ${tomlString(providerName)}
 base_url = ${tomlString(baseUrl)}
 wire_api = "responses"
-requires_openai_auth = true`;
+requires_openai_auth = ${requiresOpenAiAuth}`;
+}
+
+export function modelCatalog(
+  models: Array<
+    | string
+    | {
+        model: string;
+        displayName?: string;
+        contextWindow?: number;
+        // Native Responses (direct) overrides for the generated
+        // model-catalogs.json. Omitted input modalities are inferred by the
+        // backend: confirmed text-only models stay text-only; everything else
+        // defaults to text+image.
+        supportsParallelToolCalls?: boolean;
+        inputModalities?: string[];
+        // Vendor's OFFICIAL base_instructions; omit to inherit the neutral
+        // template default. Required by Codex, so the backend always emits one.
+        baseInstructions?: string;
+        // Reasoning efforts the vendor's endpoint actually accepts (subset of
+        // none/minimal/low/medium/high/xhigh/max/ultra). Omit to keep the
+        // template's conservative none/high default. Pre-filled from official
+        // vendor docs; users can still edit per provider in the form.
+        reasoningLevels?: string[];
+        defaultReasoningLevel?: string;
+      }
+  >,
+): CodexCatalogModel[] {
+  return models.map((entry) =>
+    typeof entry === "string"
+      ? { model: entry }
+      : {
+          model: entry.model,
+          displayName: entry.displayName,
+          contextWindow: entry.contextWindow,
+          supportsParallelToolCalls: entry.supportsParallelToolCalls,
+          inputModalities: entry.inputModalities,
+          baseInstructions: entry.baseInstructions,
+          reasoningLevels: entry.reasoningLevels,
+          defaultReasoningLevel: entry.defaultReasoningLevel,
+        },
+  );
 }
 
 export const codexProviderPresets: CodexProviderPreset[] = [

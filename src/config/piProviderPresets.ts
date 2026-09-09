@@ -47,6 +47,42 @@ export interface PiProviderPreset {
   iconColor?: string;
 }
 
+export const OPENAI_COMPLETIONS_COMPAT = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  maxTokensField: "max_tokens",
+} as const;
+
+export const DEEPSEEK_THINKING_COMPAT = {
+  ...OPENAI_COMPLETIONS_COMPAT,
+  requiresReasoningContentOnAssistantMessages: true,
+  thinkingFormat: "deepseek",
+} as const;
+
+// 1823/132248: thinking.type defaults to "enabled"; disabling requires an explicit
+// {"type":"disabled"}. The same doc says reasoning_content need not be echoed back
+// on multi-turn, so we don't reuse DEEPSEEK_THINKING_COMPAT wholesale.
+export const TENCENT_DEEPSEEK_THINKING_COMPAT = {
+  ...OPENAI_COMPLETIONS_COMPAT,
+  thinkingFormat: "deepseek",
+} as const;
+
+export const XIAOMI_THINKING_COMPAT = {
+  requiresReasoningContentOnAssistantMessages: true,
+  thinkingFormat: "deepseek",
+} as const;
+
+export const KIMI_K3_COMPAT = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  supportsReasoningEffort: true,
+  maxTokensField: "max_tokens",
+  supportsStrictMode: false,
+  thinkingFormat: "openai",
+  requiresReasoningContentOnAssistantMessages: true,
+  deferredToolsMode: "kimi",
+} as const;
+
 /**
  * Pi-native provider catalog.
  *

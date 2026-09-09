@@ -42,7 +42,8 @@
     "deleting": "Deleting...",
     "auto": "Auto",
     "enabled": "Enabled",
-    "notSet": "Not Set"
+    "notSet": "Not Set",
+    "collapse": "Collapse"
   },
   "firstRunNotice": {
     "title": "Welcome to Chimera Switch",
@@ -978,7 +979,8 @@
       "effectiveApiRequired": "Model {{id}} needs an API, either directly or from the provider",
       "effectiveBaseUrlRequired": "Model {{id}} needs a base URL, either directly or from the provider",
       "duplicateModel": "Model ID {{id}} is duplicated",
-      "modelRequired": "Add at least one model"
+      "modelRequired": "Add at least one model",
+      "providerKeyDuplicate": "This provider key already exists"
     },
     "current": {
       "readFailed": "Could not read Pi's provider configuration",
@@ -1380,6 +1382,7 @@
     "reauthLogin": "Re-login",
     "reauthSelectHint": "This account needs to sign in again to enable managed binding.",
     "reauthNow": "Re-login now",
+    "duplicateAccount": "This ChatGPT account has already been added. Use the existing account.",
     "loggedInAccounts": "Logged in accounts",
     "defaultAccount": "Default",
     "selected": "Selected",
@@ -2158,6 +2161,7 @@
     }
   },
   "profiles": {
+    "switcherAriaLabel": "Project: {{name}}",
     "switcherTooltip": {
       "claude": "Projects: switch the Claude Code provider / MCP / Skills / memory files in one click",
       "claude-desktop": "Projects: switch the Claude Desktop provider in one click",
@@ -2841,6 +2845,7 @@
     },
     "switchFailed": "Switch failed: {{error}}",
     "takeover": {
+      "ariaLabel": "{{appLabel}} local routing",
       "hint": "Select apps to route — once enabled, requests from that app will go through local routing",
       "enabled": "{{app}} routing enabled",
       "disabled": "{{app}} routing disabled",
