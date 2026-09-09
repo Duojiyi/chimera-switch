@@ -102,20 +102,73 @@ jobs:
             exit 0
           fi
 
+          origin_tag_object_sha=$(printf '%s\n' "$origin_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1; exit}')
           origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v ref="refs/tags/$TAG^{}" '$2 == ref {print $1; exit}')
           if [ -z "$origin_tag_sha" ]; then
-            origin_tag_sha=$(printf '%s\n' "$origin_refs" | awk -v ref="refs/tags/$TAG" '$2 == ref {print $1; exit}')
+            origin_tag_sha="$origin_tag_object_sha"
           fi
+          printf '%s' "$origin_tag_object_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable origin tag object for $TAG"; exit 1; }
           printf '%s' "$origin_tag_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve immutable origin commit for $TAG"; exit 1; }
-          if ! git cat-file -e "$origin_tag_sha^{commit}" 2>/dev/null; then
-            git fetch --quiet --no-tags origin "$origin_tag_sha"
+          if ! git cat-file -e "$origin_tag_object_sha" 2>/dev/null || ! git cat-file -e "$origin_tag_sha^{commit}" 2>/dev/null; then
+            git fetch --quiet --no-tags origin "refs/tags/$TAG:refs/tags/chimera-sync-validation/$TAG"
           fi
-          git merge-base --is-ancestor "$UPSTREAM_SHA" "$origin_tag_sha" || {
-            echo "::error::Origin tag $TAG does not contain upstream commit $UPSTREAM_SHA"; exit 1;
-          }
-          git merge-base --is-ancestor "$origin_tag_sha" origin/main || {
-            echo "::error::Origin tag $TAG is not reachable from protected main"; exit 1;
-          }
+          tag_provenance=$(node scripts/validate-sync-tag.mjs "$TAG" "$UPSTREAM_SHA" "$origin_tag_object_sha" "$origin_tag_sha" origin/main)
+          sync_pr_number=$(printf '%s' "$tag_provenance" | jq -r '.syncPrNumber // empty')
+          sync_pr_data=$(gh pr view "$sync_pr_number" --repo "$REPOSITORY" --json state,title,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit)
+          printf '%s' "$sync_pr_data" | jq -e \
+            --arg repo "$REPOSITORY" \
+            --arg title "sync: merge upstream $TAG" \
+            --arg base "$(printf '%s' "$tag_provenance" | jq -r .baseSha)" \
+            --arg candidate "$(printf '%s' "$tag_provenance" | jq -r .candidateSha)" \
+            --arg merged "$origin_tag_sha" \
+            '.state == "MERGED"
+            and .title == $title
+            and .headRefOid == $candidate
+            and .headRepository.nameWithOwner == $repo
+            and .baseRefName == "main"
+            and .baseRefOid == $base
+            and .mergeCommit.oid == $merged' >/dev/null || {
+              echo "::error::Sync provenance PR does not match the reviewed merge"; exit 1;
+            }
+          candidate_data=$(gh api "repos/$REPOSITORY/commits/$(printf '%s' "$tag_provenance" | jq -r .candidateSha)")
+          printf '%s' "$candidate_data" | jq -e \
+            --arg candidate "$(printf '%s' "$tag_provenance" | jq -r .candidateSha)" \
+            --arg base "$(printf '%s' "$tag_provenance" | jq -r .baseSha)" \
+            --arg tree "$(printf '%s' "$tag_provenance" | jq -r .candidateTree)" \
+            '.sha == $candidate
+            and .commit.tree.sha == $tree
+            and ([.parents[]?.sha] == [$base])' >/dev/null || {
+              echo "::error::Sync provenance candidate commit does not match the reviewed tree"; exit 1;
+            }
+          sync_run_id=$(printf '%s' "$tag_provenance" | jq -r .syncRunId)
+          sync_run_attempt=$(printf '%s' "$tag_provenance" | jq -r .syncRunAttempt)
+          sync_run_data=$(gh api "repos/$REPOSITORY/actions/runs/$sync_run_id")
+          printf '%s' "$sync_run_data" | jq -e \
+            --arg base "$(printf '%s' "$tag_provenance" | jq -r .baseSha)" \
+            --argjson attempt "$sync_run_attempt" \
+            '.path == ".github/workflows/sync-upstream.yml"
+            and .head_branch == "main"
+            and .head_sha == $base
+            and .run_attempt == $attempt
+            and (.event == "workflow_dispatch" or .event == "schedule")' >/dev/null || {
+              echo "::error::Sync provenance run does not match the reviewed main base"; exit 1;
+            }
+          sync_run_jobs=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$sync_run_id/attempts/$sync_run_attempt/jobs?per_page=100" --slurp \
+            | jq '[.[] | .jobs[]]')
+          printf '%s' "$sync_run_jobs" | jq -e \
+            --argjson attempt "$sync_run_attempt" \
+            '[.[] | select(
+              .name == "Publish verified candidate"
+              and .run_attempt == $attempt
+              and .status == "completed"
+              and ([.steps[]? | select(
+                .name == "Push candidate and create protected sync PR"
+                and .status == "completed"
+                and .conclusion == "success"
+              )] | length == 1)
+            )] | length == 1' >/dev/null || {
+              echo "::error::Sync provenance run did not complete the verified candidate publication step"; exit 1;
+            }
 
           matches=$(gh api --paginate "repos/$REPOSITORY/releases?per_page=100" --slurp \
             | jq -c --arg tag "$TAG" '[.[][] | select(.tag_name == $tag)]')
@@ -681,7 +734,27 @@ jobs:
             echo "::error::Tag $TAG already exists at $remote_tag_sha, not merged commit $merged_sha"; exit 1
           fi
           if [ -z "$remote_tag_sha" ]; then
-            git -C "$push_repo" tag -a "$TAG" "$merged_sha" -m "Release $TAG"
+            case "$GITHUB_RUN_ID" in
+              ''|*[!0-9]*|0*) echo "::error::Sync run id is not numeric: '$GITHUB_RUN_ID'"; exit 1 ;;
+            esac
+            case "$GITHUB_RUN_ATTEMPT" in
+              ''|*[!0-9]*|0*) echo "::error::Sync run attempt is not numeric: '$GITHUB_RUN_ATTEMPT'"; exit 1 ;;
+            esac
+            tag_tree=$(git -C "$push_repo" rev-parse "$merged_sha^{tree}")
+            provenance_json=$(jq -cn \
+              --arg tag "$TAG" \
+              --arg upstream_sha "$UPSTREAM_SHA" \
+              --arg base_sha "$BASE_SHA" \
+              --arg candidate_sha "$CANDIDATE_SHA" \
+              --arg candidate_tree "$candidate_tree" \
+              --arg merged_sha "$merged_sha" \
+              --arg merged_tree "$tag_tree" \
+              --argjson sync_pr_number "$pr_number" \
+              --argjson sync_run_id "$GITHUB_RUN_ID" \
+              --argjson sync_run_attempt "$GITHUB_RUN_ATTEMPT" \
+              '{schemaVersion: 1, tag: $tag, upstreamSha: $upstream_sha, baseSha: $base_sha, candidateSha: $candidate_sha, candidateTree: $candidate_tree, mergedSha: $merged_sha, mergedTree: $merged_tree, syncPrNumber: $sync_pr_number, syncRunId: $sync_run_id, syncRunAttempt: $sync_run_attempt}')
+            tag_message=$(printf 'Release %s\n\n%s\n%s' "$TAG" '<!-- chimera-sync-provenance:v1 -->' "$provenance_json")
+            git -C "$push_repo" tag -a "$TAG" "$merged_sha" -m "$tag_message"
             git_auth -C "$push_repo" push --atomic origin "refs/tags/$TAG"
           fi
 
