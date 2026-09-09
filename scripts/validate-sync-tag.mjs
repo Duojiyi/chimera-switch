@@ -1,10 +1,25 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 export const SYNC_TAG_MARKER = "<!-- chimera-sync-provenance:v1 -->";
+
+// Reserved exit code telling the caller that the tag was created before the
+// provenance scheme existed and can only be validated against a record
+// rebuilt from the GitHub API.
+export const LEGACY_TAG_EXIT_CODE = 3;
+
+// Thrown instead of a plain failure so the caller can tell "this tag predates
+// provenance" apart from "this tag is malformed or forged".
+export class LegacySyncTagError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "LegacySyncTagError";
+  }
+}
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 const TAG_PATTERN = /^v[0-9]+\.[0-9]+\.[0-9]+$/;
@@ -76,14 +91,22 @@ function parseTagHeaders(raw) {
   };
 }
 
-function parseProvenanceMessage(message, expectedTag, expectedUpstreamSha) {
+// Tags written before SYNC_TAG_MARKER existed carry exactly this message, so
+// recognizing it cannot widen what counts as a valid provenance-carrying tag.
+function classifyTagMessage(message, expectedTag) {
   const normalized = message.replaceAll("\r\n", "\n");
+  if (normalized === `Release ${expectedTag}\n`) {
+    return { kind: "legacy" };
+  }
+
   const prefix = `Release ${expectedTag}\n\n${SYNC_TAG_MARKER}\n`;
   if (!normalized.startsWith(prefix) || !normalized.endsWith("\n")) {
     fail("annotated tag message does not match the sync provenance format");
   }
+  return { kind: "provenance", jsonText: normalized.slice(prefix.length, -1) };
+}
 
-  const jsonText = normalized.slice(prefix.length, -1);
+function parseProvenanceJson(jsonText, expectedTag, expectedUpstreamSha) {
   if (!jsonText || jsonText.includes("\n")) {
     fail("sync provenance JSON must be one line");
   }
@@ -94,6 +117,14 @@ function parseProvenanceMessage(message, expectedTag, expectedUpstreamSha) {
   } catch (error) {
     fail(`sync provenance is not valid JSON: ${error.message}`);
   }
+  return validateProvenanceRecord(provenance, expectedTag, expectedUpstreamSha);
+}
+
+export function validateProvenanceRecord(
+  provenance,
+  expectedTag,
+  expectedUpstreamSha,
+) {
   if (
     !provenance ||
     typeof provenance !== "object" ||
@@ -149,6 +180,7 @@ export function parseSyncTagObject({
   expectedTag,
   expectedUpstreamSha,
   expectedTargetSha,
+  legacyRecord,
 }) {
   if (typeof raw !== "string") fail("annotated tag contents must be text");
   if (!TAG_PATTERN.test(expectedTag)) {
@@ -164,11 +196,31 @@ export function parseSyncTagObject({
     fail("annotated tag target does not match the peeled tag commit");
   }
 
-  const provenance = parseProvenanceMessage(
-    headers.message,
-    expectedTag,
-    expectedUpstreamSha,
-  );
+  const classified = classifyTagMessage(headers.message, expectedTag);
+  let provenance;
+  if (classified.kind === "legacy") {
+    if (legacyRecord === undefined) {
+      throw new LegacySyncTagError(
+        "annotated tag predates sync provenance and needs a rebuilt record",
+      );
+    }
+    provenance = validateProvenanceRecord(
+      legacyRecord,
+      expectedTag,
+      expectedUpstreamSha,
+    );
+  } else {
+    if (legacyRecord !== undefined) {
+      fail(
+        "annotated tag already carries provenance; refusing a rebuilt record",
+      );
+    }
+    provenance = parseProvenanceJson(
+      classified.jsonText,
+      expectedTag,
+      expectedUpstreamSha,
+    );
+  }
   if (provenance.mergedSha !== expectedTargetSha) {
     fail("sync provenance mergedSha does not match the tag target");
   }
@@ -204,6 +256,7 @@ export function validateSyncTag({
   expectedUpstreamSha,
   mainRef = "origin/main",
   cwd = process.cwd(),
+  legacyRecord,
 }) {
   requireSha(tagObjectSha, "annotated tag object SHA");
   requireSha(targetSha, "peeled tag commit SHA");
@@ -214,11 +267,14 @@ export function validateSyncTag({
   if (runGit(["cat-file", "-t", tagObjectSha], cwd).trim() !== "tag") {
     fail("sync release tag must be an annotated tag");
   }
+  // A rebuilt record is only ever as trustworthy as the checks below, so the
+  // git-structural rules stay identical for both provenance sources.
   const provenance = parseSyncTagObject({
     raw: runGit(["cat-file", "-p", tagObjectSha], cwd),
     expectedTag,
     expectedUpstreamSha,
     expectedTargetSha: targetSha,
+    legacyRecord,
   });
 
   if (runGit(["cat-file", "-t", targetSha], cwd).trim() !== "commit") {
@@ -266,19 +322,42 @@ export function validateSyncTag({
   return provenance;
 }
 
+const LEGACY_RECORD_FLAG = "--legacy-record=";
+
 function main() {
+  const positional = [];
+  let legacyRecordPath;
+  for (const argument of process.argv.slice(2)) {
+    if (argument.startsWith(LEGACY_RECORD_FLAG)) {
+      legacyRecordPath = argument.slice(LEGACY_RECORD_FLAG.length);
+      continue;
+    }
+    positional.push(argument);
+  }
+
   const [
     expectedTag,
     expectedUpstreamSha,
     tagObjectSha,
     targetSha,
     mainRef = "origin/main",
-  ] = process.argv.slice(2);
+  ] = positional;
   if (!expectedTag || !expectedUpstreamSha || !tagObjectSha || !targetSha) {
     fail(
-      "usage: validate-sync-tag.mjs <tag> <upstream-sha> <tag-object-sha> <target-sha> [main-ref]",
+      "usage: validate-sync-tag.mjs [--legacy-record=<path>] <tag> <upstream-sha> <tag-object-sha> <target-sha> [main-ref]",
     );
   }
+
+  let legacyRecord;
+  if (legacyRecordPath !== undefined) {
+    if (!legacyRecordPath) fail("rebuilt sync record path is empty");
+    try {
+      legacyRecord = JSON.parse(readFileSync(legacyRecordPath, "utf8"));
+    } catch (error) {
+      fail(`rebuilt sync record is unreadable: ${error.message}`);
+    }
+  }
+
   process.stdout.write(
     `${JSON.stringify(
       validateSyncTag({
@@ -287,6 +366,7 @@ function main() {
         expectedTag,
         expectedUpstreamSha,
         mainRef,
+        legacyRecord,
       }),
     )}\n`,
   );
@@ -300,7 +380,12 @@ if (isMainModule) {
     main();
   } catch (error) {
     const message = String(error?.message ?? error).replace(/[\r\n]+/g, " ");
-    console.error(`::error::${message}`);
-    process.exitCode = 1;
+    if (error instanceof LegacySyncTagError) {
+      console.error(`::notice::${message}`);
+      process.exitCode = LEGACY_TAG_EXIT_CODE;
+    } else {
+      console.error(`::error::${message}`);
+      process.exitCode = 1;
+    }
   }
 }

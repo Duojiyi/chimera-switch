@@ -112,7 +112,83 @@ jobs:
           if ! git cat-file -e "$origin_tag_object_sha" 2>/dev/null || ! git cat-file -e "$origin_tag_sha^{commit}" 2>/dev/null; then
             git fetch --quiet --no-tags origin "refs/tags/$TAG:refs/tags/chimera-sync-validation/$TAG"
           fi
-          tag_provenance=$(node scripts/validate-sync-tag.mjs "$TAG" "$UPSTREAM_SHA" "$origin_tag_object_sha" "$origin_tag_sha" origin/main)
+          tag_provenance=""
+          provenance_status=0
+          tag_provenance=$(node scripts/validate-sync-tag.mjs "$TAG" "$UPSTREAM_SHA" "$origin_tag_object_sha" "$origin_tag_sha" origin/main) || provenance_status=$?
+          if [ "$provenance_status" -eq 3 ]; then
+            # Tags pushed before the provenance scheme carry only "Release <tag>"
+            # and can never gain a record retroactively. Rebuild the same fields
+            # from the merged sync PR so every check below stays identical, and
+            # let validate-sync-tag.mjs re-apply the git-structural rules to the
+            # rebuilt record. Only the upstream-commit binding is weaker here: it
+            # rests on the sync PR title rather than on the signed tag body.
+            echo "::notice::Release tag $TAG predates sync provenance; rebuilding its record from the merged sync PR."
+            legacy_branch="automation/upstream-sync-$TAG"
+            legacy_prs=$(gh pr list --repo "$REPOSITORY" --head "$legacy_branch" --base main --state merged \
+              --json number,title,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit)
+            [ "$(printf '%s' "$legacy_prs" | jq 'length')" -eq 1 ] || {
+              echo "::error::Expected exactly one merged sync PR on $legacy_branch for $TAG"; exit 1;
+            }
+            legacy_pr=$(printf '%s' "$legacy_prs" | jq -c '.[0]')
+            printf '%s' "$legacy_pr" | jq -e \
+              --arg repo "$REPOSITORY" \
+              --arg title "sync: merge upstream $TAG" \
+              --arg merged "$origin_tag_sha" '
+              .title == $title
+              and .headRepository.nameWithOwner == $repo
+              and .baseRefName == "main"
+              and .mergeCommit.oid == $merged' >/dev/null || {
+                echo "::error::Merged sync PR for $TAG is not the reviewed merge behind the origin tag"; exit 1;
+              }
+            legacy_candidate_sha=$(printf '%s' "$legacy_pr" | jq -r .headRefOid)
+            legacy_base_sha=$(printf '%s' "$legacy_pr" | jq -r .baseRefOid)
+            legacy_candidate_tree=$(gh api "repos/$REPOSITORY/commits/$legacy_candidate_sha" --jq .commit.tree.sha)
+            legacy_merged_tree=$(gh api "repos/$REPOSITORY/commits/$origin_tag_sha" --jq .commit.tree.sha)
+            # Bind the rebuilt record to exactly one sync run that actually
+            # published this candidate, using the same evidence the run checks
+            # below re-verify.
+            legacy_run_id=""
+            legacy_run_attempt=""
+            while IFS=' ' read -r candidate_run_id candidate_run_attempt; do
+              candidate_jobs=$(gh api --paginate \
+                "repos/$REPOSITORY/actions/runs/$candidate_run_id/attempts/$candidate_run_attempt/jobs?per_page=100" --slurp \
+                | jq '[.[] | .jobs[]]')
+              printf '%s' "$candidate_jobs" | jq -e --argjson attempt "$candidate_run_attempt" '
+                [.[] | select(
+                  .name == "Publish verified candidate"
+                  and .run_attempt == $attempt
+                  and .status == "completed"
+                  and ([.steps[]? | select(
+                    .name == "Push candidate and create protected sync PR"
+                    and .status == "completed"
+                    and .conclusion == "success"
+                  )] | length == 1)
+                )] | length == 1' >/dev/null || continue
+              [ -z "$legacy_run_id" ] || { echo "::error::Multiple sync runs published a candidate for $TAG"; exit 1; }
+              legacy_run_id="$candidate_run_id"
+              legacy_run_attempt="$candidate_run_attempt"
+            done < <(gh api --paginate \
+              "repos/$REPOSITORY/actions/workflows/sync-upstream.yml/runs?branch=main&head_sha=$legacy_base_sha&per_page=100" --slurp \
+              | jq -r '[.[] | .workflow_runs[]] | .[] | "\(.id) \(.run_attempt)"')
+            [ -n "$legacy_run_id" ] || { echo "::error::No sync run published the reviewed candidate for $TAG"; exit 1; }
+            jq -n \
+              --arg tag "$TAG" \
+              --arg upstream_sha "$UPSTREAM_SHA" \
+              --arg base_sha "$legacy_base_sha" \
+              --arg candidate_sha "$legacy_candidate_sha" \
+              --arg candidate_tree "$legacy_candidate_tree" \
+              --arg merged_sha "$origin_tag_sha" \
+              --arg merged_tree "$legacy_merged_tree" \
+              --argjson sync_pr_number "$(printf '%s' "$legacy_pr" | jq .number)" \
+              --argjson sync_run_id "$legacy_run_id" \
+              --argjson sync_run_attempt "$legacy_run_attempt" \
+              '{schemaVersion: 1, tag: $tag, upstreamSha: $upstream_sha, baseSha: $base_sha, candidateSha: $candidate_sha, candidateTree: $candidate_tree, mergedSha: $merged_sha, mergedTree: $merged_tree, syncPrNumber: $sync_pr_number, syncRunId: $sync_run_id, syncRunAttempt: $sync_run_attempt}' \
+              > "$RUNNER_TEMP/rebuilt-sync-record.json"
+            tag_provenance=$(node scripts/validate-sync-tag.mjs "--legacy-record=$RUNNER_TEMP/rebuilt-sync-record.json" "$TAG" "$UPSTREAM_SHA" "$origin_tag_object_sha" "$origin_tag_sha" origin/main)
+          elif [ "$provenance_status" -ne 0 ]; then
+            echo "::error::Could not validate the origin release tag provenance for $TAG"
+            exit 1
+          fi
           sync_pr_number=$(printf '%s' "$tag_provenance" | jq -r '.syncPrNumber // empty')
           sync_pr_data=$(gh pr view "$sync_pr_number" --repo "$REPOSITORY" --json state,title,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit)
           printf '%s' "$sync_pr_data" | jq -e \

@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  LegacySyncTagError,
   SYNC_TAG_MARKER,
   parseSyncTagObject,
   validateSyncTag,
@@ -137,6 +138,29 @@ function createTag({
   return {
     objectSha: git(directory, ["rev-parse", `refs/tags/${refName}`]),
     provenance,
+  };
+}
+
+// Tags pushed before the provenance scheme carry only "Release <tag>".
+function createLegacyTag({ directory, refName, tag, targetSha }) {
+  git(directory, ["tag", "-a", refName, targetSha, "-m", `Release ${tag}`]);
+  return git(directory, ["rev-parse", `refs/tags/${refName}`]);
+}
+
+function rebuiltRecord({ repository, targetSha, overrides = {} }) {
+  return {
+    ...tagProvenance({
+      tag: TAG,
+      upstreamSha: repository.upstreamSha,
+      baseSha: repository.baseSha,
+      candidateSha: targetSha,
+      mergedSha: targetSha,
+      mergedTree: git(repository.directory, [
+        "rev-parse",
+        `${targetSha}^{tree}`,
+      ]),
+    }),
+    ...overrides,
   };
 }
 
@@ -310,6 +334,186 @@ describe("sync release tag provenance", () => {
             expectedTargetSha: repository.reviewedSha,
           }),
         /message does not match/,
+      );
+    });
+  });
+});
+
+describe("sync release tags created before provenance existed", () => {
+  it("rebuilds the record from the merged sync PR instead of failing", () => {
+    const workflow = fs.readFileSync(
+      path.join(repositoryRoot, ".github/workflows/sync-upstream.yml"),
+      "utf8",
+    );
+    assert.match(
+      workflow,
+      /--legacy-record=\$RUNNER_TEMP\/rebuilt-sync-record\.json/,
+    );
+    assert.match(workflow, /provenance_status" -eq 3/);
+    assert.match(
+      workflow,
+      /gh pr list --repo "\$REPOSITORY" --head "\$legacy_branch"/,
+    );
+    // A rebuilt record must never bypass the run evidence the tag would carry.
+    assert.match(workflow, /No sync run published the reviewed candidate/);
+    assert.match(workflow, /Multiple sync runs published a candidate/);
+  });
+
+  it("reports a distinguishable signal so callers can rebuild the record", () => {
+    withRepository((repository) => {
+      const tagObjectSha = createLegacyTag({
+        directory: repository.directory,
+        refName: TAG,
+        tag: TAG,
+        targetSha: repository.reviewedSha,
+      });
+      assert.throws(
+        () =>
+          validateSyncTag({
+            tagObjectSha,
+            targetSha: repository.reviewedSha,
+            expectedTag: TAG,
+            expectedUpstreamSha: repository.upstreamSha,
+            mainRef: "refs/heads/main",
+            cwd: repository.directory,
+          }),
+        (error) =>
+          error instanceof LegacySyncTagError &&
+          /predates sync provenance/.test(error.message),
+      );
+    });
+  });
+
+  it("accepts a rebuilt record that matches the tagged squash commit", () => {
+    withRepository((repository) => {
+      const tagObjectSha = createLegacyTag({
+        directory: repository.directory,
+        refName: TAG,
+        tag: TAG,
+        targetSha: repository.reviewedSha,
+      });
+      const legacyRecord = rebuiltRecord({
+        repository,
+        targetSha: repository.reviewedSha,
+      });
+      assert.deepEqual(
+        validateSyncTag({
+          tagObjectSha,
+          targetSha: repository.reviewedSha,
+          expectedTag: TAG,
+          expectedUpstreamSha: repository.upstreamSha,
+          mainRef: "refs/heads/main",
+          cwd: repository.directory,
+          legacyRecord,
+        }),
+        legacyRecord,
+      );
+    });
+  });
+
+  it("still applies every git-structural rule to a rebuilt record", () => {
+    withRepository((repository) => {
+      const tagObjectSha = createLegacyTag({
+        directory: repository.directory,
+        refName: TAG,
+        tag: TAG,
+        targetSha: repository.reviewedSha,
+      });
+      const validate = (overrides) =>
+        validateSyncTag({
+          tagObjectSha,
+          targetSha: repository.reviewedSha,
+          expectedTag: TAG,
+          expectedUpstreamSha: repository.upstreamSha,
+          mainRef: "refs/heads/main",
+          cwd: repository.directory,
+          legacyRecord: rebuiltRecord({
+            repository,
+            targetSha: repository.reviewedSha,
+            overrides,
+          }),
+        });
+
+      assert.throws(
+        () => validate({ baseSha: repository.unreviewedSha }),
+        /squash commit based on provenance baseSha/,
+      );
+      assert.throws(
+        () =>
+          validate({
+            candidateTree: "a".repeat(40),
+            mergedTree: "a".repeat(40),
+          }),
+        /mergedTree does not match the tag target tree/,
+      );
+      assert.throws(
+        () => validate({ mergedSha: repository.unreviewedSha }),
+        /mergedSha does not match the tag target/,
+      );
+      assert.throws(
+        () => validate({ candidateTree: "b".repeat(40) }),
+        /candidate and merged trees differ/,
+      );
+    });
+  });
+
+  it("rejects a rebuilt record for a target that is not on protected main", () => {
+    withRepository((repository) => {
+      const tagObjectSha = createLegacyTag({
+        directory: repository.directory,
+        refName: "v3.20.3",
+        tag: "v3.20.3",
+        targetSha: repository.unreviewedSha,
+      });
+      assert.throws(
+        () =>
+          validateSyncTag({
+            tagObjectSha,
+            targetSha: repository.unreviewedSha,
+            expectedTag: "v3.20.3",
+            expectedUpstreamSha: repository.upstreamSha,
+            mainRef: "refs/heads/main",
+            cwd: repository.directory,
+            legacyRecord: {
+              ...rebuiltRecord({
+                repository,
+                targetSha: repository.unreviewedSha,
+              }),
+              tag: "v3.20.3",
+            },
+          }),
+        /not reachable from protected main/,
+      );
+    });
+  });
+
+  it("refuses to let a rebuilt record override real tag provenance", () => {
+    withRepository((repository) => {
+      const tag = createTag({
+        directory: repository.directory,
+        refName: TAG,
+        tag: TAG,
+        upstreamSha: repository.upstreamSha,
+        baseSha: repository.baseSha,
+        candidateSha: repository.reviewedSha,
+        targetSha: repository.reviewedSha,
+      });
+      assert.throws(
+        () =>
+          validateSyncTag({
+            tagObjectSha: tag.objectSha,
+            targetSha: repository.reviewedSha,
+            expectedTag: TAG,
+            expectedUpstreamSha: repository.upstreamSha,
+            mainRef: "refs/heads/main",
+            cwd: repository.directory,
+            legacyRecord: rebuiltRecord({
+              repository,
+              targetSha: repository.reviewedSha,
+              overrides: { syncPrNumber: 999 },
+            }),
+          }),
+        /refusing a rebuilt record/,
       );
     });
   });
