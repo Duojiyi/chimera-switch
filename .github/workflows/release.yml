@@ -1116,12 +1116,17 @@ jobs:
             verify_draft_identity "$release" "$release_id" || { echo "::error::Existing release is not the expected bot-owned draft"; exit 1; }
             echo "Reusing verified bot-owned draft $RELEASE_TAG (release id $release_id)."
           else
+            # The tag is verified above to already exist at RELEASE_SHA, so the
+            # API ignores target_commitish anyway. Sending it makes the request
+            # count as tag materialization, which additionally demands
+            # workflows:write whenever the target's .github/workflows tree has
+            # drifted from the default branch tip. GITHUB_TOKEN can never hold
+            # that scope, and the refusal surfaces only as a bare 403.
             jq -n \
               --arg tag "$RELEASE_TAG" \
-              --arg target "$RELEASE_SHA" \
               --arg title "$expected_title" \
               --rawfile body release-notes.md \
-              '{tag_name:$tag,target_commitish:$target,name:$title,body:$body,draft:true,prerelease:false,make_latest:"false"}' \
+              '{tag_name:$tag,name:$title,body:$body,draft:true,prerelease:false,make_latest:"false"}' \
               > create-release.json
             release=$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" --input create-release.json)
             release_id=$(printf '%s' "$release" | jq -r '.id // empty')

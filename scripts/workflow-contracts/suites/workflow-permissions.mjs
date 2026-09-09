@@ -1158,6 +1158,29 @@ describe("release promotion state machine", () => {
   });
 });
 
+describe("release draft creation scope", () => {
+  it("binds the draft to the pre-existing tag without materializing it", () => {
+    const { release } = loadProductionWorkflows();
+    const draftStep = release.jobs["publish-release-draft"].steps.find(
+      (step) =>
+        step.name === "Create or reuse bot-owned draft and upload assets",
+    );
+
+    // A commitish in the payload turns the call into tag materialization, which
+    // demands workflows:write once the target's .github/workflows tree has
+    // drifted from the default branch tip -- a scope GITHUB_TOKEN can never
+    // hold, and the refusal surfaces only as a bare 403.
+    expect(draftStep.run).toContain(
+      "'{tag_name:$tag,name:$title,body:$body,draft:true,prerelease:false,make_latest:\"false\"}'",
+    );
+    expect(draftStep.run).not.toContain('--arg target "$RELEASE_SHA"');
+    // Dropping it is only safe because the tag is already pinned to the commit.
+    expect(draftStep.run).toContain(
+      '[ "$remote_sha" = "$RELEASE_SHA" ] || { echo "::error::Tag $RELEASE_TAG moved during the build',
+    );
+  });
+});
+
 describe("reusable release workflow permissions", () => {
   it("grants exactly the required read permissions to caller and callee", () => {
     const { caller, callee } = loadProductionWorkflows();
