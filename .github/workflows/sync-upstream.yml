@@ -327,20 +327,32 @@ jobs:
           sync_run_id=$(printf '%s' "$tag_provenance" | jq -r .syncRunId)
           sync_run_attempt=$(printf '%s' "$tag_provenance" | jq -r .syncRunAttempt)
           sync_run_data=$(gh api "repos/$REPOSITORY/actions/runs/$sync_run_id")
-          sync_run_expected_head=$(printf '%s' "$tag_provenance" | jq -r .baseSha)
-          if [ "$sync_pr_candidate_sha" = "$origin_tag_sha" ] && [ "$sync_pr_head_sha" != "$sync_pr_candidate_sha" ]; then
-            sync_run_expected_head="$origin_tag_sha"
-          fi
+          sync_run_head=$(printf '%s' "$sync_run_data" | jq -r .head_sha)
+          printf '%s' "$sync_run_head" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Sync provenance run has no immutable head SHA"; exit 1; }
           printf '%s' "$sync_run_data" | jq -e \
-            --arg expected_head "$sync_run_expected_head" \
             --argjson attempt "$sync_run_attempt" \
             '.path == ".github/workflows/sync-upstream.yml"
             and .head_branch == "main"
-            and .head_sha == $expected_head
             and .run_attempt == $attempt
             and (.event == "workflow_dispatch" or .event == "schedule")' >/dev/null || {
+              echo "::error::Sync provenance run does not match the protected workflow"; exit 1;
+            }
+          if [ "$sync_pr_candidate_sha" = "$origin_tag_sha" ] && [ "$sync_pr_head_sha" != "$sync_pr_candidate_sha" ]; then
+            # A tag-recovery run starts after the reviewed PR was merged and may
+            # include later workflow fixes. Bind it between the tag target and
+            # the current protected main instead of requiring either endpoint.
+            git merge-base --is-ancestor "$origin_tag_sha" "$sync_run_head" || {
+              echo "::error::Tag-recovery run predates the reviewed sync commit"; exit 1;
+            }
+            git merge-base --is-ancestor "$sync_run_head" origin/main || {
+              echo "::error::Tag-recovery run is not on protected main history"; exit 1;
+            }
+          else
+            sync_run_expected_head=$(printf '%s' "$tag_provenance" | jq -r .baseSha)
+            [ "$sync_run_head" = "$sync_run_expected_head" ] || {
               echo "::error::Sync provenance run does not match the reviewed main base"; exit 1;
             }
+          fi
           sync_run_jobs=$(gh api --paginate "repos/$REPOSITORY/actions/runs/$sync_run_id/attempts/$sync_run_attempt/jobs?per_page=100" --slurp \
             | jq '[.[] | .jobs[]]')
           printf '%s' "$sync_run_jobs" | jq -e \
