@@ -189,6 +189,25 @@ describe("sync release tag provenance", () => {
     );
   });
 
+  it("binds tag-recovery runs to protected main history", () => {
+    const workflow = fs.readFileSync(
+      path.join(repositoryRoot, ".github/workflows/sync-upstream.yml"),
+      "utf8",
+    );
+    assert.match(
+      workflow,
+      /merge-base --is-ancestor "\$origin_tag_sha" "\$sync_run_head"/,
+    );
+    assert.match(
+      workflow,
+      /merge-base --is-ancestor "\$sync_run_head" origin\/main/,
+    );
+    assert.match(
+      workflow,
+      /\[ "\$sync_run_head" = "\$sync_run_expected_head" \]/,
+    );
+  });
+
   it("accepts a squash tag with valid provenance without upstream ancestry", () => {
     withRepository((repository) => {
       const tag = createTag({
