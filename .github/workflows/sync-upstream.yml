@@ -616,42 +616,6 @@ jobs:
           [ -n "${GH_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is missing"; exit 1; }
           gh api "repos/$REPOSITORY" >/dev/null
 
-      - name: Assemble missing or incomplete draft with exact run binding
-        id: recovery
-        if: needs.prepare.outputs.recovery == 'true' && needs.prepare.outputs.release_required == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-        run: |
-          set -euo pipefail
-          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
-          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$'
-          request_id="sync-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
-          expected_title="Release $TAG / $request_id"
-          dispatch_started_at=$(date -u +%s)
-          # repository_dispatch uses repository contents access and preserves
-          # an exact request identifier without requiring workflow mutation scope.
-          jq -n \
-            --arg tag "$TAG" \
-            --arg request_id "$request_id" \
-            --arg tooling_sha "$tooling_sha" \
-            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
-            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
-          recovery_run_id=""
-          for attempt in $(seq 1 30); do
-            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
-              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
-              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' || true)
-            [ -n "$recovery_run_id" ] && break
-            sleep 2
-          done
-          [ -n "$recovery_run_id" ] || { echo "::error::Could not bind the dispatched release run to request $request_id"; exit 1; }
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$recovery_run_id")
-          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
-          gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status
-          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
-
       - name: Download candidate bundle
         if: needs.prepare.outputs.recovery != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1057,6 +1021,42 @@ jobs:
           git -C "$push_repo" tag -a "$TAG" "$RECOVERY_CANDIDATE_SHA" -m "$tag_message"
           git_auth -C "$push_repo" push --atomic origin "refs/tags/$TAG"
           echo "Protected recovery tag $TAG now points at $RECOVERY_CANDIDATE_SHA."
+
+      - name: Assemble missing or incomplete draft with exact run binding
+        id: recovery
+        if: needs.prepare.outputs.recovery == 'true' && needs.prepare.outputs.release_required == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
+          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$'
+          request_id="sync-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
+          expected_title="Release $TAG / $request_id"
+          dispatch_started_at=$(date -u +%s)
+          # repository_dispatch uses repository contents access and preserves
+          # an exact request identifier without requiring workflow mutation scope.
+          jq -n \
+            --arg tag "$TAG" \
+            --arg request_id "$request_id" \
+            --arg tooling_sha "$tooling_sha" \
+            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
+            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
+          recovery_run_id=""
+          for attempt in $(seq 1 30); do
+            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
+              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
+              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' || true)
+            [ -n "$recovery_run_id" ] && break
+            sleep 2
+          done
+          [ -n "$recovery_run_id" ] || { echo "::error::Could not bind the dispatched release run to request $request_id"; exit 1; }
+          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$recovery_run_id")
+          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
+            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
+          gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status
+          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
 
       - name: Generate high-entropy release request id
         id: request
