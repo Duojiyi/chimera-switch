@@ -72,6 +72,13 @@ export const XIAOMI_THINKING_COMPAT = {
   thinkingFormat: "deepseek",
 } as const;
 
+// DashScope's /compatible-mode/v1 returns reasoning in Qwen's own envelope and
+// rejects the `developer` role, so neither OpenAI nor DeepSeek thinking applies.
+export const QWEN_THINKING_COMPAT = {
+  thinkingFormat: "qwen",
+  supportsDeveloperRole: false,
+} as const;
+
 export const KIMI_K3_COMPAT = {
   supportsStore: false,
   supportsDeveloperRole: false,
