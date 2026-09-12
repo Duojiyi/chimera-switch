@@ -354,6 +354,14 @@ describe("sync release tags created before provenance existed", () => {
       workflow,
       /gh pr list --repo "\$REPOSITORY" --head "\$legacy_branch"/,
     );
+    assert.match(
+      workflow,
+      /git merge-base --is-ancestor "\$recovery_merge_sha" "\$current_main"/,
+    );
+    assert.match(
+      workflow,
+      /git -C "\$push_repo" merge-base --is-ancestor "\$RECOVERY_CANDIDATE_SHA" "\$current_main"/,
+    );
     // A rebuilt record must never bypass the run evidence the tag would carry.
     assert.match(workflow, /No sync run published the reviewed candidate/);
     assert.match(workflow, /Multiple sync runs published a candidate/);

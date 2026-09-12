@@ -129,14 +129,15 @@ jobs:
               --arg repo "$REPOSITORY" \
               --arg title "sync: merge upstream $TAG" \
               --arg branch "$recovery_branch" \
-              --arg main "$current_main" \
               '.title == $title
               and .headRefName == $branch
               and .headRepository.nameWithOwner == $repo
-              and .baseRefName == "main"
-              and .mergeCommit.oid == $main' >/dev/null || {
-                echo "::error::Merged sync PR does not match the current protected main"; exit 1;
-              }
+              and .baseRefName == "main"' >/dev/null || {
+                echo "::error::Merged sync PR identity does not match the expected protected sync PR"; exit 1;
+            }
+            git merge-base --is-ancestor "$recovery_merge_sha" "$current_main" || {
+              echo "::error::Merged sync PR is not an ancestor of the current protected main"; exit 1;
+            }
             merge_data=$(gh api "repos/$REPOSITORY/commits/$recovery_merge_sha")
             head_data=$(gh api "repos/$REPOSITORY/commits/$recovery_head_sha")
             printf '%s' "$merge_data" | jq -e \
@@ -944,7 +945,9 @@ jobs:
           git -C "$push_repo" remote add origin "https://github.com/$REPOSITORY.git"
           git_auth -C "$push_repo" fetch --quiet --no-tags origin refs/heads/main
           current_main=$(git -C "$push_repo" rev-parse FETCH_HEAD)
-          [ "$current_main" = "$RECOVERY_CANDIDATE_SHA" ] || { echo "::error::Protected main changed since recovery was prepared"; exit 1; }
+          git -C "$push_repo" merge-base --is-ancestor "$RECOVERY_CANDIDATE_SHA" "$current_main" || {
+            echo "::error::Recovered sync commit is not an ancestor of the current protected main"; exit 1;
+          }
 
           pr_data=$(gh pr view "$RECOVERY_PR_NUMBER" --repo "$REPOSITORY" \
             --json state,title,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,mergeCommit)
