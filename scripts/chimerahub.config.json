@@ -33,6 +33,7 @@
     "comment": "断言第三方/赞助商预设存在的上游测试文件。debrand 剪掉这些预设后它们必然失败，因此 debrand 会删除本清单中的文件，check-debrand 断言它们不存在。上游新增同类测试时同步门禁会在 vitest 处失败，把新路径加到这里即可。",
     "files": [
       "src/config/codexProviderPresets.test.ts",
+      "src/config/codexProviderPresets.tokenPlanTextOnly.test.ts",
       "src/config/jiekouProviderPresets.test.ts",
       "src/config/ppioProviderPresets.test.ts",
       "tests/config/claudeProviderPresets.test.ts",
