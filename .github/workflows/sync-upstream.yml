@@ -1,15 +1,13 @@
 name: Sync upstream
 
-# 上游 cc-switch（farion1231/cc-switch）发布稳定版后自动同步去广告版。
+# 上游 cc-switch（farion1231/cc-switch）发布稳定版后，由维护者手动同步去广告版。
 # prepare job 只处理公开上游代码，publish job 才能接触 SYNC_TOKEN；两者之间只传
-# git bundle 和不可执行的元数据。发布先组装完整 draft，验证后由 promote-release 一次发布为不可变 stable。
+# git bundle 和不可执行的元数据。同步完成后由维护者手动运行 release 和 promote-release。
 
 run-name: Sync upstream / ${{ github.run_id }}
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '17 */6 * * *'
 
 permissions:
   contents: read
@@ -90,7 +88,7 @@ jobs:
       - name: Setup Node.js for release contract checks
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Check existing tag and release
         id: check
@@ -432,7 +430,7 @@ jobs:
       - name: Setup pnpm
         if: steps.check.outputs.skip != 'true'
         env:
-          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
         run: |
           set -euo pipefail
           corepack enable
@@ -1037,131 +1035,12 @@ jobs:
           git_auth -C "$push_repo" push --atomic origin "refs/tags/$TAG"
           echo "Protected recovery tag $TAG now points at $RECOVERY_CANDIDATE_SHA."
 
-      - name: Assemble missing or incomplete draft with exact run binding
-        id: recovery
-        if: needs.prepare.outputs.recovery == 'true' && needs.prepare.outputs.release_required == 'true'
+      - name: Hand off release and cloud publication to maintainer
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          set -euo pipefail
-          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
-          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$'
-          request_id="sync-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 8)"
-          expected_title="Release $TAG / $request_id"
-          dispatch_started_at=$(date -u +%s)
-          # repository_dispatch uses repository contents access and preserves
-          # an exact request identifier without requiring workflow mutation scope.
-          jq -n \
-            --arg tag "$TAG" \
-            --arg request_id "$request_id" \
-            --arg tooling_sha "$tooling_sha" \
-            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
-            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
-          recovery_run_id=""
-          for attempt in $(seq 1 30); do
-            recovery_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
-              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
-              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' || true)
-            [ -n "$recovery_run_id" ] && break
-            sleep 2
-          done
-          [ -n "$recovery_run_id" ] || { echo "::error::Could not bind the dispatched release run to request $request_id"; exit 1; }
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$recovery_run_id")
-          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
-          gh run watch "$recovery_run_id" --repo "$REPOSITORY" --exit-status
-          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Generate high-entropy release request id
-        id: request
-        shell: bash
-        run: |
-          set -euo pipefail
-          request_id="sync-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(openssl rand -hex 16)"
-          printf '%s' "$request_id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$' || { echo "::error::Generated request id has an invalid format"; exit 1; }
-          printf 'request_id=%s\n' "$request_id" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch and wait for release build
-        id: release
-        if: needs.prepare.outputs.recovery != 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          REQUEST_ID: ${{ steps.request.outputs.request_id }}
-        run: |
-          set -euo pipefail
-          [ -n "${GH_TOKEN:-}" ] || { echo "::error::SYNC_TOKEN is missing"; exit 1; }
-          tooling_sha=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
-          printf '%s' "$tooling_sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve reviewed main SHA"; exit 1; }
-          expected_title="Release $TAG / $REQUEST_ID"
-          dispatch_started_at=$(date -u +%s)
-          # repository_dispatch avoids the classic PAT workflow scope while
-          # retaining an exact request id and protected-main binding.
-          jq -n \
-            --arg tag "$TAG" \
-            --arg request_id "$REQUEST_ID" \
-            --arg tooling_sha "$tooling_sha" \
-            '{event_type: "release-request", client_payload: {tag: $tag, request_id: $request_id, tooling_sha: $tooling_sha}}' \
-            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
-          release_run_id=""
-          for attempt in $(seq 1 30); do
-            release_run_id=$(gh run list --repo "$REPOSITORY" --workflow release.yml --event repository_dispatch --limit 50 \
-              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
-              | jq -r --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' \
-              2>/dev/null || true)
-            [ -n "$release_run_id" ] && break
-            sleep 2
-          done
-          [ -n "$release_run_id" ] || { echo "::error::Could not bind release run to request $REQUEST_ID"; exit 1; }
-          case "$release_run_id" in
-            ''|*[!0-9]*|0*) echo "::error::Bound release run id is not numeric: '$release_run_id'"; exit 1 ;;
-          esac
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$release_run_id")
-          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$tooling_sha" --argjson lower "$dispatch_started_at" \
-            '.path == ".github/workflows/release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
-          echo "Waiting for exact release run $release_run_id (request $REQUEST_ID)."
-          gh run watch "$release_run_id" --repo "$REPOSITORY" --exit-status
-          printf 'tooling_sha=%s\n' "$tooling_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Dispatch and wait for stable promotion and R2 sync
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          REQUEST_ID: ${{ steps.request.outputs.request_id }}
-        run: |
-          set -euo pipefail
-          TOOLING_SHA=$(git ls-remote "https://github.com/$REPOSITORY.git" refs/heads/main | awk 'NR == 1 {print $1}')
-          printf '%s' "$TOOLING_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::Could not resolve protected main for promotion binding"; exit 1; }
-          expected_title="Promote $TAG / $REQUEST_ID"
-          dispatch_started_at=$(date -u +%s)
-          # repository_dispatch avoids the classic PAT workflow scope while
-          # retaining an exact request id and protected-main binding.
-          jq -n \
-            --arg tag "$TAG" \
-            --arg request_id "$REQUEST_ID" \
-            '{event_type: "promote-release-request", client_payload: {tag: $tag, request_id: $request_id}}' \
-            | gh api --method POST "repos/$REPOSITORY/dispatches" --input -
-          promote_run_id=""
-          for attempt in $(seq 1 30); do
-            promote_run_id=$(gh run list --repo "$REPOSITORY" --workflow promote-release.yml --event repository_dispatch --limit 50 \
-              --json databaseId,displayTitle,headSha,headBranch,event,createdAt,workflowName \
-              | jq -r --arg title "$expected_title" --arg sha "$TOOLING_SHA" --argjson lower "$dispatch_started_at" \
-              'map(select(.displayTitle == $title and .headSha == $sha and .headBranch == "main" and .event == "repository_dispatch" and .workflowName == "Promote release" and ((.createdAt | fromdateiso8601) >= $lower))) | sort_by(.createdAt) | .[0].databaseId // empty' \
-              2>/dev/null || true)
-            [ -n "$promote_run_id" ] && break
-            sleep 2
-          done
-          [ -n "$promote_run_id" ] || { echo "::error::Could not bind promote run to request $REQUEST_ID"; exit 1; }
-          case "$promote_run_id" in
-            ''|*[!0-9]*|0*) echo "::error::Bound promote run id is not numeric: '$promote_run_id'"; exit 1 ;;
-          esac
-          run_info=$(gh api "repos/$REPOSITORY/actions/runs/$promote_run_id")
-          printf '%s' "$run_info" | jq -e --arg title "$expected_title" --arg sha "$TOOLING_SHA" --argjson lower "$dispatch_started_at" \
-            '.path == ".github/workflows/promote-release.yml" and .display_title == $title and .head_sha == $sha and .head_branch == "main" and .event == "repository_dispatch" and ((.created_at | fromdateiso8601) >= $lower)' >/dev/null
-          echo "Waiting for exact promotion/R2 run $promote_run_id (request $REQUEST_ID)."
-          gh run watch "$promote_run_id" --repo "$REPOSITORY" --exit-status
+          echo "Sync completed for $TAG. No release or cloud publication was triggered automatically."
+          echo "Next: manually run Release on main with tag $TAG, then Promote release on main with the same tag."
 
   notify:
     name: Notify synchronization failure

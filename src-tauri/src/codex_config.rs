@@ -1135,6 +1135,13 @@ pub fn extract_codex_api_key(auth: Option<&Value>, config_text: Option<&str>) ->
         .or_else(|| config_text.and_then(extract_codex_experimental_bearer_token))
 }
 
+fn codex_api_key_auth_value(key: &str) -> Value {
+    json!({
+        "auth_mode": "apikey",
+        "OPENAI_API_KEY": key,
+    })
+}
+
 /// Extract the upstream base URL from a Codex `config.toml` string.
 ///
 /// Prefers the active `[model_providers.<model_provider>].base_url`, falling
@@ -3281,8 +3288,8 @@ pub fn neutralize_codex_official_auth_fallback_for_proxy_oauth(
 /// `resolve_provider_auth` short-circuits on `env_key` /
 /// `experimental_bearer_token` before consulting it — but it does drive the
 /// login UX: `true` with no login in `auth.json` traps the TUI in the
-/// login/onboarding screen (preservation off deletes the file on every
-/// third-party switch), while `false` next to a preserved ChatGPT login
+/// login/onboarding screen (preservation off removes a keyless provider's
+/// file, while API-key providers keep an explicit `apikey` marker), while `false` next to a preserved ChatGPT login
 /// makes Codex treat the session as logged out (account state hidden, the
 /// preserved tokens never refreshed). Stored third-party configs cannot be
 /// trusted here: presets and the custom template carried
@@ -3865,15 +3872,16 @@ fn plan_codex_live_write(
         });
     }
 
-    // Third-party switches are config-only. Since Codex 0.149
-    // (openai/codex#39214) custom providers no longer inherit ambient auth
-    // from auth.json, so the API key travels as a provider-scoped
-    // `experimental_bearer_token` in config.toml (honored since Codex 0.48).
-    // auth.json is reserved for the official ChatGPT login: kept when the
-    // preservation setting is on, deleted otherwise. It never carries
-    // third-party keys, so a `requires_openai_auth = true` fallback has no
-    // third-party credential to mis-send and pre-0.48 auth.json-only Codex
-    // releases are the only casualty.
+    // Since Codex 0.149 (openai/codex#39214) custom providers no longer
+    // inherit request auth from auth.json, so the API key travels as a
+    // provider-scoped `experimental_bearer_token` in config.toml (honored
+    // since Codex 0.48). The desktop app nevertheless uses auth.json to
+    // decide whether the user has completed authentication. Keep the OAuth
+    // login when preservation is enabled; otherwise materialize an API-key
+    // auth.json when this provider has a key so the desktop app does not send
+    // the user through "Other ways to log in" after every restart. The
+    // provider's `requires_openai_auth = false` / bearer short-circuit keeps
+    // that API-key auth out of third-party request routing.
     // The key may live in auth.OPENAI_API_KEY or already sit in the config
     // text (e.g. `auth = {}` raw-edited providers) — mirror
     // prepare_codex_provider_live_config's token sources.
@@ -3901,13 +3909,13 @@ fn plan_codex_live_write(
     let config_text = normalized.as_deref().or(config_text);
 
     // The preservation setting decides whether the official login in
-    // auth.json survives a third-party switch. Off means the file is
-    // deleted — a lingering login next to a third-party route is the leak
-    // shape the gates exist to prevent, and `{}` is not logout, the file
-    // must go (see clear_stale_codex_live_auth_after_official_switch). The
-    // active table's `requires_openai_auth` is stamped to match below, so
-    // Codex's login UX agrees with the file state either way.
-    let remove_auth_file = !preserve_official_login;
+    // auth.json survives a third-party switch. With a third-party API key,
+    // preserve-off writes an explicit API-key login instead of deleting the
+    // file: the desktop app requires an auth.json login marker even though
+    // request auth is resolved from the provider-scoped bearer above. A
+    // keyless third-party provider still removes auth.json, as before.
+    let write_api_key_auth = !preserve_official_login && carried_key.is_some();
+    let remove_auth_file = !preserve_official_login && !write_api_key_auth;
 
     let live_config = match config_text {
         Some(text) if !text.trim().is_empty() => {
@@ -3947,7 +3955,7 @@ fn plan_codex_live_write(
     )?;
 
     Ok(CodexLiveWritePlan {
-        write_full_auth: false,
+        write_full_auth: write_api_key_auth,
         config_text: Some(live_config),
         remove_auth_file,
     })
@@ -3983,7 +3991,14 @@ pub fn write_codex_live_for_provider(
         crate::settings::preserve_codex_official_auth_on_switch(),
     )?;
     if plan.write_full_auth {
-        return write_codex_live_atomic(auth, plan.config_text.as_deref());
+        // Codex Desktop recognizes API-key authentication only when the
+        // auth.json mode is explicit. Keep the live auth file limited to the
+        // provider key; the request itself still uses the provider-scoped
+        // bearer token in config.toml.
+        let live_auth = extract_codex_api_key(Some(auth), config_text)
+            .map(|key| codex_api_key_auth_value(&key))
+            .unwrap_or_else(|| auth.clone());
+        return write_codex_live_atomic(&live_auth, plan.config_text.as_deref());
     }
     write_codex_live_config_atomic(plan.config_text.as_deref())?;
     // Config is already committed at this point, so a cleanup failure
@@ -5895,7 +5910,11 @@ base_url = "https://bedrock.example/v1"
             off_text.contains("experimental_bearer_token = \"sk-test\""),
             "the bearer injection must be unaffected; got:\n{off_text}"
         );
-        assert!(off.remove_auth_file, "preservation off deletes auth.json");
+        assert!(
+            off.write_full_auth,
+            "API-key providers write desktop auth.json"
+        );
+        assert!(!off.remove_auth_file, "API-key providers keep auth.json");
 
         let on = plan_codex_live_write(None, &auth, Some(stale_true), true)
             .expect("third-party plan with preservation on");
@@ -5917,6 +5936,20 @@ base_url = "https://bedrock.example/v1"
             on_flagless_text.contains("requires_openai_auth = true"),
             "preservation on must stamp flagless cards; got:\n{on_flagless_text}"
         );
+    }
+
+    #[test]
+    fn api_key_auth_value_uses_codex_desktop_login_shape() {
+        let auth = codex_api_key_auth_value("sk-test");
+        assert_eq!(
+            auth.get("auth_mode").and_then(Value::as_str),
+            Some("apikey")
+        );
+        assert_eq!(
+            auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+            Some("sk-test")
+        );
+        assert!(codex_auth_has_openai_account_material(&auth));
     }
 
     #[test]

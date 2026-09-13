@@ -1,10 +1,8 @@
 name: Promote release
 
-run-name: ${{ (inputs.repair_r2 || github.event.client_payload.repair_r2) && 'Repair R2' || 'Promote' }} ${{ inputs.tag || github.event.client_payload.tag }} / ${{ inputs.request_id || github.event.client_payload.request_id || github.run_id }}
+run-name: ${{ inputs.repair_r2 && 'Repair R2' || 'Promote' }} ${{ inputs.tag }} / ${{ inputs.request_id || github.run_id }}
 
 on:
-  repository_dispatch:
-    types: [promote-release-request]
   workflow_dispatch:
     inputs:
       tag:
@@ -31,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+  TAG: ${{ inputs.tag }}
   REPOSITORY: ${{ github.repository }}
   UPDATER_PUBLIC_KEY: dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3MDQ4MDk2MEZCNTdEMjEKUldRaGZiVVBsb0FFUjJDTC9rRi9UVEo2bEZOb1ZlL1FuWHJPN25ldGJ2UFlrcHJEaDV3UWhVc0YK
 
@@ -49,15 +47,10 @@ jobs:
       - name: Validate request and correlation id
         id: request
         env:
-          INPUT_REQUEST_ID: ${{ inputs.request_id || github.event.client_payload.request_id || '' }}
-          EVENT_ACTION: ${{ github.event.action || '' }}
+          INPUT_REQUEST_ID: ${{ inputs.request_id || '' }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::Promotion must run from the protected main branch"; exit 1; }
-          if [ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != promote-release-request ]; then
-            echo "::error::Unexpected repository_dispatch action"
-            exit 1
-          fi
           reject_line_breaks() {
             case "$2" in
               *$'\r'*|*$'\n'*) echo "::error::$1 must be a single line"; exit 1 ;;
@@ -79,7 +72,7 @@ jobs:
       - name: Resolve requested operation
         id: route
         env:
-          RAW_REPAIR_R2: ${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}
+          RAW_REPAIR_R2: ${{ inputs.repair_r2 || false }}
         run: |
           set -euo pipefail
           case "$RAW_REPAIR_R2" in
@@ -493,7 +486,7 @@ jobs:
           run_info=$(gh api "repos/$REPOSITORY/actions/runs/$workflow_run_id/attempts/$workflow_run_attempt")
           printf '%s' "$run_info" | jq -e --arg repo "$REPOSITORY" --arg sha "$release_tooling_sha" --argjson attempt "$workflow_run_attempt" '
             .path == ".github/workflows/release.yml"
-            and (.event == "workflow_dispatch" or .event == "repository_dispatch")
+            and .event == "workflow_dispatch"
             and .head_branch == "main" and .head_sha == $sha
             and .repository.full_name == $repo and .run_attempt == $attempt
             and .conclusion == "success"

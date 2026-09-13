@@ -707,15 +707,12 @@ wire_api = "responses"
 }
 
 #[test]
-fn provider_service_switch_codex_default_removes_auth_json_when_preservation_off() {
+fn provider_service_switch_codex_default_writes_api_key_auth_when_preservation_off() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
-    // Intentionally do NOT enable preservation: this locks the default opt-out
-    // behavior where a third-party switch deletes auth.json outright — the
-    // official OAuth login is not preserved, and the third-party key never
-    // lands there either (it travels as the provider-scoped bearer token in
-    // config.toml). It is the dual of
-    // `provider_service_switch_codex_preserves_oauth_and_backfills_api_key_from_live_token`.
+    // Intentionally do NOT enable preservation: the default third-party path
+    // discards official OAuth material but keeps an API-key login marker so the
+    // desktop client does not reopen its official login screen after restart.
     let _home = ensure_test_home();
 
     let live_auth = json!({
@@ -783,10 +780,19 @@ requires_openai_auth = true
     ProviderService::switch(&state, AppType::Codex, "third-party")
         .expect("switch to third-party provider should succeed");
 
-    assert!(
-        !chimera_switch_lib::get_codex_auth_path().exists(),
-        "default (preservation off) must delete auth.json on a third-party switch — \
-         the official login goes away and the key rides in config.toml instead"
+    let live_auth: serde_json::Value =
+        read_json_file(&chimera_switch_lib::get_codex_auth_path()).expect("read auth.json");
+    assert_eq!(
+        live_auth.get("auth_mode").and_then(|value| value.as_str()),
+        Some("apikey"),
+        "a third-party API-key switch must leave Codex in API-key mode"
+    );
+    assert_eq!(
+        live_auth
+            .get("OPENAI_API_KEY")
+            .and_then(|value| value.as_str()),
+        Some("third-party-key"),
+        "the selected third-party API key must be available after restart"
     );
     let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
         .expect("read config.toml");
@@ -801,9 +807,8 @@ fn provider_service_switch_codex_default_injects_bearer_token_into_config() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     // Preservation stays OFF (default). Since Codex 0.149 (openai/codex#39214)
-    // custom providers no longer inherit ambient auth, so third-party switches
-    // are config-only on every path: the key travels as a provider-scoped
-    // `experimental_bearer_token` and auth.json is removed.
+    // custom providers no longer inherit ambient auth, so keep the key both in
+    // the provider-scoped bearer token and in the desktop API-key auth marker.
     let _home = ensure_test_home();
 
     let third_party_config = r#"model_provider = "aihubmix"
@@ -840,9 +845,19 @@ requires_openai_auth = false
     ProviderService::switch(&state, AppType::Codex, "third-party")
         .expect("switch to third-party provider should succeed");
 
-    assert!(
-        !chimera_switch_lib::get_codex_auth_path().exists(),
-        "third-party switches are config-only: no auth.json is written"
+    let live_auth: serde_json::Value =
+        read_json_file(&chimera_switch_lib::get_codex_auth_path()).expect("read auth.json");
+    assert_eq!(
+        live_auth.get("auth_mode").and_then(|value| value.as_str()),
+        Some("apikey"),
+        "third-party API-key switches must write an API-key auth marker"
+    );
+    assert_eq!(
+        live_auth
+            .get("OPENAI_API_KEY")
+            .and_then(|value| value.as_str()),
+        Some("third-party-key"),
+        "the third-party key must survive a desktop restart"
     );
 
     let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
@@ -1037,9 +1052,8 @@ fn provider_service_switch_codex_default_normalizes_legacy_reroute_config() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     // Same legacy shape with preservation OFF (default): the switch is
-    // config-only on every path, so instead of feeding the built-in
-    // provider's ambient auth through auth.json the shape is normalized into
-    // a custom table and auth.json is removed.
+    // The shape is normalized into a custom table and the API-key auth marker
+    // is written so the desktop client stays out of the official login flow.
     let _home = ensure_test_home();
 
     let legacy_shape_config = r#"model_provider = "openai"
@@ -1071,9 +1085,19 @@ openai_base_url = "https://relay.example/v1"
     ProviderService::switch(&state, AppType::Codex, "legacy-shape")
         .expect("default-path switch must normalize the legacy ambient-auth shape");
 
-    assert!(
-        !chimera_switch_lib::get_codex_auth_path().exists(),
-        "third-party switches are config-only: no auth.json is written"
+    let live_auth: serde_json::Value =
+        read_json_file(&chimera_switch_lib::get_codex_auth_path()).expect("read auth.json");
+    assert_eq!(
+        live_auth.get("auth_mode").and_then(|value| value.as_str()),
+        Some("apikey"),
+        "normalized third-party API-key switches must write an API-key auth marker"
+    );
+    assert_eq!(
+        live_auth
+            .get("OPENAI_API_KEY")
+            .and_then(|value| value.as_str()),
+        Some("third-party-key"),
+        "the third-party key must survive a desktop restart"
     );
     let live_config = std::fs::read_to_string(chimera_switch_lib::get_codex_config_path())
         .expect("read config.toml");

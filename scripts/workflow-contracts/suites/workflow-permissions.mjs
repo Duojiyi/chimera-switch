@@ -756,7 +756,6 @@ describe("release promotion permissions", () => {
 
 describe("release promotion routing", () => {
   const requestEnvironment = Object.freeze({
-    EVENT_ACTION: "",
     GITHUB_EVENT_NAME: "workflow_dispatch",
     GITHUB_REF: "refs/heads/main",
     GITHUB_RUN_ATTEMPT: "1",
@@ -805,14 +804,14 @@ describe("release promotion routing", () => {
     expect(routeStep.id).toBe("route");
     expect(requestStep.env.RAW_REPAIR_R2).toBeUndefined();
     expect(routeStep.env.RAW_REPAIR_R2).toBe(
-      "${{ inputs.repair_r2 || github.event.client_payload.repair_r2 || false }}",
+      "${{ inputs.repair_r2 || false }}",
     );
     expect(requestStep.run).toContain("reject_line_breaks request_id");
     expect(requestStep.run).toContain("printf 'tag=%s\\nrequest_id=%s\\n'");
     expect(routeStep.run).toContain("printf 'mode=%s\\n'");
   });
 
-  it("passes repository dispatch actions through the supported event context", () => {
+  it("exposes manual workflow dispatch as the only publication entrypoint", () => {
     const { caller, release } = loadProductionWorkflows();
     const releaseValidation = release.jobs["validate-release"].steps.find(
       (step) => step.name === "Validate requested tag",
@@ -821,41 +820,20 @@ describe("release promotion routing", () => {
       (step) => step.name === "Validate request and correlation id",
     );
 
-    expect(releaseValidation.env.EVENT_ACTION).toBe(
-      "${{ github.event.action || '' }}",
+    expect(release.on.repository_dispatch).toBeUndefined();
+    expect(caller.on.repository_dispatch).toBeUndefined();
+    expect(releaseValidation.env.REQUESTED_TAG).toBe(
+      "${{ inputs.tag || github.ref_name }}",
     );
-    expect(promotionRequest.env.EVENT_ACTION).toBe(
-      "${{ github.event.action || '' }}",
+    expect(promotionRequest.env.INPUT_REQUEST_ID).toBe(
+      "${{ inputs.request_id || '' }}",
     );
     expect(releaseValidation.run).toContain(
-      '[ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != release-request ]',
+      'if [ "$GITHUB_REF" != refs/heads/main ]; then',
     );
-    expect(promotionRequest.run).toContain(
-      '[ "$GITHUB_EVENT_NAME" = repository_dispatch ] && [ "$EVENT_ACTION" != promote-release-request ]',
-    );
-    expect(releaseValidation.run).not.toContain("GITHUB_EVENT_ACTION");
-    expect(promotionRequest.run).not.toContain("GITHUB_EVENT_ACTION");
+    expect(releaseValidation.run).not.toContain("repository_dispatch");
+    expect(promotionRequest.run).not.toContain("repository_dispatch");
   });
-
-  it.each([
-    ["promote-release-request", 0],
-    ["wrong-action", 1],
-  ])(
-    "handles repository dispatch action %s without an implicit env var",
-    (action, expectedStatus) => {
-      const { caller } = loadProductionWorkflows();
-      const requestStep = getRun(
-        caller.jobs.request,
-        "Validate request and correlation id",
-      );
-      const result = runBashScript(requestStep, {
-        ...requestEnvironment,
-        GITHUB_EVENT_NAME: "repository_dispatch",
-        EVENT_ACTION: action,
-      });
-      expect(result.status).toBe(expectedStatus);
-    },
-  );
 
   it("rejects multiline output injection before writing request outputs", () => {
     const { caller } = loadProductionWorkflows();
