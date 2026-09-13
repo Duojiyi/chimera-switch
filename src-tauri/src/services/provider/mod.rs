@@ -2665,11 +2665,19 @@ wire_api = "responses"
                 )
                 .as_deref(),
                 Some("cli-refresh-b1"),
-                "B's CLI generation must be adopted before the third-party switch removes auth.json"
+                "B's CLI generation must be adopted before the third-party switch rewrites auth.json"
             );
-            assert!(
-                !crate::codex_config::get_codex_auth_path().exists(),
-                "third-party switches are config-only: auth.json is removed"
+            let live_auth: Value = read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read API-key auth");
+            assert_eq!(
+                live_auth.get("auth_mode").and_then(Value::as_str),
+                Some("apikey"),
+                "third-party API-key switches must leave Codex Desktop in API-key mode"
+            );
+            assert_eq!(
+                live_auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+                Some("sk-third-party"),
+                "third-party API key must be available to Codex Desktop after restart"
             );
             let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
                 .expect("read third-party config");
@@ -5471,16 +5479,24 @@ impl ProviderService {
                 Err(e) => log::warn!("Failed to clean stale Codex auth.json: {e}"),
             }
         }
-        // Third-party dual of the block above: with preservation off, the
-        // config-only write is expected to delete auth.json. A deletion
-        // failure (read-only dir, ACL, file lock) must not fail the switch —
-        // config and current are already committed — but the user has to see
-        // that the official login is still on disk, so surface it as a
-        // switch warning instead of only a log line.
+        // Keyless third-party writes still delete auth.json when preservation
+        // is off. A deletion failure (read-only dir, ACL, file lock) must not
+        // fail the switch because config and current are already committed,
+        // but surface the stale official login as a switch warning. API-key
+        // providers intentionally keep an explicit apikey auth.json marker.
+        let third_party_api_key = crate::codex_config::extract_codex_api_key(
+            provider.settings_config.get("auth"),
+            provider
+                .settings_config
+                .get("config")
+                .and_then(serde_json::Value::as_str),
+        )
+        .is_some();
         if matches!(app_type, AppType::Codex)
             && provider.category.as_deref() != Some("official")
             && !crate::proxy::providers::is_codex_official_provider(provider)
             && !crate::settings::preserve_codex_official_auth_on_switch()
+            && !third_party_api_key
             && crate::codex_config::get_codex_auth_path().exists()
         {
             log::warn!("Codex auth.json still present after a preservation-off third-party switch");

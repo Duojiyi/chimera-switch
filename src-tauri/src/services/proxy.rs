@@ -7116,13 +7116,20 @@ wire_api = "responses"
             .write_codex_live_for_provider(&takeover_settings, Some(&provider))
             .expect("write provider-driven Codex live config");
 
-        // Disabled preservation historically overwrote the OAuth login with
-        // the placeholder; config-only switching removes auth.json instead —
-        // the login is equally gone, and the placeholder now travels as the
-        // provider-scoped bearer token that Codex >= 0.149 actually sends.
-        assert!(
-            !crate::codex_config::get_codex_auth_path().exists(),
-            "disabled preservation removes auth.json on a third-party takeover write"
+        // A third-party API-key takeover writes an explicit API-key login
+        // marker for Codex Desktop while the provider-scoped bearer token
+        // remains the request credential.
+        let live_auth: Value =
+            read_json_file(&crate::codex_config::get_codex_auth_path()).expect("read API-key auth");
+        assert_eq!(
+            live_auth.get("auth_mode").and_then(Value::as_str),
+            Some("apikey"),
+            "third-party takeover must leave Codex Desktop in API-key mode"
+        );
+        assert_eq!(
+            live_auth.get("OPENAI_API_KEY").and_then(Value::as_str),
+            Some(PROXY_TOKEN_PLACEHOLDER),
+            "the takeover key must remain available after restart"
         );
 
         let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
