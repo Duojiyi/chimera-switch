@@ -6,7 +6,7 @@ use crate::app_config::AppType;
 use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
 use crate::provider::Provider;
-use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
+use crate::proxy::providers::codex_oauth_auth::{CodexLiveAuthSwitchGuard, CodexOAuthManager};
 use crate::proxy::server::ProxyServer;
 use crate::proxy::switch_lock::SwitchLockManager;
 use crate::proxy::types::*;
@@ -720,7 +720,7 @@ impl ProxyService {
         &self,
         provider: &Provider,
         outgoing_managed_account_id: Option<&str>,
-        expected_outgoing_refresh_token: Option<&str>,
+        outgoing_guard: Option<&CodexLiveAuthSwitchGuard>,
     ) -> Result<(), String> {
         let existing_live = self.read_codex_live().ok();
         let mut effective_settings = build_effective_provider_for_live_with_codex_oauth_manager(
@@ -745,17 +745,14 @@ impl ProxyService {
             provider,
         )?;
 
-        if let (Some(account_id), Some(expected_refresh_token)) =
-            (outgoing_managed_account_id, expected_outgoing_refresh_token)
-        {
-            crate::codex_config::ensure_codex_live_auth_unchanged_for_managed_account(
-                account_id,
-                expected_refresh_token,
-            )
-            .map_err(|error| error.to_string())?;
+        if let (Some(account_id), Some(guard)) = (outgoing_managed_account_id, outgoing_guard) {
+            guard
+                .ensure_unchanged(account_id)
+                .map_err(|error| error.to_string())?;
         }
 
         self.write_codex_takeover_live_for_provider(&effective_settings, Some(provider))?;
+        Self::materialize_takeover_api_key_auth(provider)?;
         Ok(())
     }
 
@@ -1194,6 +1191,27 @@ impl ProxyService {
                 // 只看占位符会把半接管/旧端口残留误判为可复用，导致开启接管后
                 // live 文件仍停留在普通供应商配置。
                 if has_backup && live_matches_current_proxy {
+                    if matches!(app, AppType::Codex) {
+                        if let Some(provider_id) =
+                            crate::settings::get_effective_current_provider(&self.db, &app)
+                                .map_err(|error| error.to_string())?
+                        {
+                            if let Some(account_id) = self
+                                .db
+                                .get_provider_by_id(&provider_id, app_type_str)
+                                .map_err(|error| error.to_string())?
+                                .filter(crate::proxy::providers::is_codex_official_provider)
+                                .and_then(|provider| provider.meta)
+                                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                                .filter(|id| !id.trim().is_empty())
+                            {
+                                self.codex_oauth_manager
+                                    .ensure_account_exists(account_id.trim())
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                        }
+                    }
                     self.refresh_active_target_from_current_provider(&app).await;
                     return Ok(());
                 }
@@ -3017,13 +3035,14 @@ impl ProxyService {
             .is_some();
         let live_taken_over = self.detect_takeover_in_live_config_for_app(&app_type_enum);
         let should_sync_backup = has_backup || live_taken_over;
-        let outgoing_live_refresh_token =
+        let outgoing_live_auth_guard =
             if should_sync_backup && matches!(app_type_enum, AppType::Codex) {
                 match outgoing_managed_codex_account_id.as_deref() {
                     Some(account_id) => self
                         .codex_oauth_manager
                         .prepare_live_auth_for_account_switch_away(account_id)
                         .await
+                        .map(Some)
                         .map_err(|error| error.to_string())?,
                     None => None,
                 }
@@ -3069,7 +3088,7 @@ impl ProxyService {
                     self.sync_codex_live_from_provider_while_proxy_active_guarded(
                         &provider,
                         outgoing_managed_codex_account_id.as_deref(),
-                        outgoing_live_refresh_token.as_deref(),
+                        outgoing_live_auth_guard.as_ref(),
                     )
                     .await?;
                 } else if live_taken_over && matches!(app_type_enum, AppType::GrokBuild) {
@@ -3096,15 +3115,13 @@ impl ProxyService {
                     &effective_provider,
                 );
 
-                if let (Some(account_id), Some(expected_refresh_token)) = (
+                if let (Some(account_id), Some(guard)) = (
                     outgoing_managed_codex_account_id.as_deref(),
-                    outgoing_live_refresh_token.as_deref(),
+                    outgoing_live_auth_guard.as_ref(),
                 ) {
-                    crate::codex_config::ensure_codex_live_auth_unchanged_for_managed_account(
-                        account_id,
-                        expected_refresh_token,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    guard
+                        .ensure_unchanged(account_id)
+                        .map_err(|error| error.to_string())?;
                 }
 
                 crate::codex_config::write_codex_provider_live_with_catalog(
@@ -3122,17 +3139,13 @@ impl ProxyService {
             }
 
             if should_sync_backup && matches!(app_type_enum, AppType::Codex) {
-                if let Some(account_id) = outgoing_managed_codex_account_id.as_deref() {
-                    if let Some(expected_refresh_token) = outgoing_live_refresh_token.as_deref() {
-                        crate::codex_config::clear_codex_live_auth_for_managed_account_if_unchanged(
-                            account_id,
-                            Some(expected_refresh_token),
-                        )
+                if let (Some(account_id), Some(guard)) = (
+                    outgoing_managed_codex_account_id.as_deref(),
+                    outgoing_live_auth_guard.as_ref(),
+                ) {
+                    guard
+                        .clear_outgoing(account_id)
                         .map_err(|error| error.to_string())?;
-                    } else {
-                        crate::codex_config::clear_codex_live_auth_for_managed_account(account_id)
-                            .map_err(|error| error.to_string())?;
-                    }
                 }
             }
 
@@ -3753,6 +3766,57 @@ impl ProxyService {
         }
 
         self.write_codex_live_for_provider(config, provider)
+    }
+
+    /// A template enabled directly through takeover skips the direct-switch
+    /// path that gives Codex Desktop its explicit API-key login. Repair only
+    /// the safe file-store shape: never touch OAuth/Bedrock credentials and
+    /// never guess for keyring/auto stores.
+    fn materialize_takeover_api_key_auth(provider: &Provider) -> Result<(), String> {
+        if crate::proxy::providers::is_codex_official_provider(provider)
+            || crate::settings::preserve_codex_official_auth_on_switch()
+        {
+            return Ok(());
+        }
+
+        let stored_config = provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !matches!(
+            crate::codex_config::codex_config_auth_store_mode(stored_config),
+            crate::codex_config::CodexAuthStoreMode::File
+        ) {
+            return Ok(());
+        }
+
+        let Some(key) = provider
+            .settings_config
+            .get("auth")
+            .and_then(|auth| auth.get("OPENAI_API_KEY"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != PROXY_TOKEN_PLACEHOLDER)
+        else {
+            return Ok(());
+        };
+
+        let auth_path = crate::codex_config::get_codex_auth_path();
+        if auth_path.exists() {
+            let existing: Value = crate::config::read_json_file(&auth_path)
+                .map_err(|error| format!("读取 Codex auth 失败，跳过接管登录态修复: {error}"))?;
+            if Self::codex_auth_has_proxy_placeholder(&existing) {
+                return Ok(());
+            }
+            if crate::codex_config::codex_auth_has_credential_login_material(&existing) {
+                return Ok(());
+            }
+        }
+
+        let api_key_auth = crate::codex_config::codex_api_key_auth_value(key);
+        crate::config::write_json_file(&auth_path, &api_key_auth)
+            .map_err(|e| format!("写入 Codex auth 失败: {e}"))
     }
 
     fn write_codex_live_verbatim(&self, config: &Value) -> Result<(), String> {
@@ -6521,6 +6585,78 @@ requires_openai_auth = true
         assert!(
             !crate::codex_config::get_codex_auth_path().exists(),
             "takeover must not create auth.json"
+        );
+
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_takeover_sync_materializes_explicit_api_key_auth_for_templates() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings {
+            preserve_codex_official_auth_on_switch: false,
+            ..Default::default()
+        })
+        .expect("disable Codex official auth preservation");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let provider = Provider::with_id(
+            "kimi".to_string(),
+            "Kimi".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "kimi-key" },
+                "config": r#"model_provider = "kimi"
+model = "kimi-k2"
+
+[model_providers.kimi]
+name = "Kimi"
+base_url = "https://api.moonshot.cn/v1"
+wire_api = "responses"
+"#
+            }),
+            None,
+        );
+
+        service
+            .sync_codex_live_from_provider_while_proxy_active(&provider)
+            .await
+            .expect("sync template takeover");
+        let auth: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read auth created by template takeover");
+        assert_eq!(
+            auth,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "kimi-key"
+            })
+        );
+
+        // Older builds left an implicit API key behind. Refreshing the same
+        // route must repair its login shape without waiting for a direct
+        // switch.
+        crate::codex_config::write_codex_live_atomic(
+            &json!({ "OPENAI_API_KEY": "legacy-key" }),
+            None,
+        )
+        .expect("seed legacy implicit API-key auth");
+        service
+            .sync_codex_live_from_provider_while_proxy_active(&provider)
+            .await
+            .expect("resync template takeover");
+        let repaired: Value =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read repaired auth");
+        assert_eq!(
+            repaired,
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "kimi-key"
+            })
         );
 
         crate::settings::update_settings(crate::settings::AppSettings::default())

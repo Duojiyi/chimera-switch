@@ -65,9 +65,7 @@ export interface ClaudeDesktopProviderPreset {
   iconColor?: string;
 }
 
-export const passthroughRoutes = (
-  supports1m = false,
-): ClaudeDesktopRoutePreset[] => [
+export const passthroughRoutes = (supports1m = false): ClaudeDesktopRoutePreset[] => [
   {
     routeId: CLAUDE_DESKTOP_ROLE_ROUTE_IDS.sonnet,
     upstreamModel: CLAUDE_DESKTOP_ROLE_ROUTE_IDS.sonnet,
