@@ -43,10 +43,7 @@ export interface OpenClawProviderPreset {
   suggestedDefaults?: OpenClawSuggestedDefaults;
 }
 
-export function rebaseOpenClawModelRef(
-  modelRef: string,
-  providerKey: string,
-): string {
+export function rebaseOpenClawModelRef(modelRef: string, providerKey: string): string {
   const slashIndex = modelRef.indexOf("/");
   return slashIndex === -1
     ? `${providerKey}/${modelRef}`

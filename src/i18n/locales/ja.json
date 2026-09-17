@@ -914,7 +914,8 @@
     "opencode": "OpenCode",
     "openclaw": "OpenClaw",
     "hermes": "Hermes",
-    "pi": "Pi"
+    "pi": "Pi",
+    "mcode": "MiniMax Code"
   },
   "pi": {
     "empty": {
@@ -1199,7 +1200,7 @@
     "officialHint": "💡 公式プロバイダーはブラウザログインで、API Key は不要です",
     "providerKeyStatusLoading": "プロバイダー識別子の状態を読み込んでいます。しばらくしてからもう一度お試しください",
     "getApiKey": "API Key を取得",
-
+    
     "presets": {
       "ucloud": "Compshare",
       "ucloudCoding": "Compshare Coding Plan",
@@ -1682,7 +1683,8 @@
       "gemini": "Gemini",
       "opencode": "OpenCode",
       "grokbuild": "Grok Build",
-      "pi": "Pi"
+      "pi": "Pi",
+      "mcode": "MiniMax Code"
     },
     "rawInputLabel": "原始",
     "sessionSync": {
@@ -1986,7 +1988,8 @@
         "grokbuild": "Grok Build",
         "opencode": "OpenCode",
         "openclaw": "OpenClaw",
-        "hermes": "Hermes"
+        "hermes": "Hermes",
+        "mcode": "MiniMax Code"
       }
     },
     "userLevelPath": "ユーザーレベルの MCP パス",

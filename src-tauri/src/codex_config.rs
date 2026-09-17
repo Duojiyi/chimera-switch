@@ -737,7 +737,7 @@ pub(crate) fn codex_live_auth_matches_managed_request(
     Ok(live_access_token == Some(request_access_token.trim()))
 }
 
-fn clear_codex_managed_oauth_live_auth_marker_for_account(
+pub(crate) fn clear_codex_managed_oauth_live_auth_marker_for_account(
     account_id: &str,
 ) -> Result<(), AppError> {
     let marker_path = get_codex_managed_oauth_live_auth_marker_path();
@@ -1135,7 +1135,7 @@ pub fn extract_codex_api_key(auth: Option<&Value>, config_text: Option<&str>) ->
         .or_else(|| config_text.and_then(extract_codex_experimental_bearer_token))
 }
 
-fn codex_api_key_auth_value(key: &str) -> Value {
+pub(crate) fn codex_api_key_auth_value(key: &str) -> Value {
     json!({
         "auth_mode": "apikey",
         "OPENAI_API_KEY": key,

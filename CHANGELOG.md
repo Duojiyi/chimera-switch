@@ -5,6 +5,11 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.20.5] - 2026-09-17
+
+- feat: merge upstream MiniMax Code harness support, Codex account-binding recovery, Claude Desktop Linux configuration, and proxy/model-list fixes
+- fix(codex): materialize explicit API-key login state when a ChimeraHub template is enabled directly through proxy takeover
+
 ## [3.20.4] - 2026-09-13
 
 - fix(codex): keep API-key authentication available to the Codex desktop client after switching to a third-party provider
